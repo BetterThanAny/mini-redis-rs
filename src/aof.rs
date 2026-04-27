@@ -52,12 +52,14 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
     let mut buf = BytesMut::from(&all[..]);
     let mut applied = 0u64;
     while !buf.is_empty() {
-        match parser::parse(&mut buf)? {
-            None => {
+        // Tolerate corruption in the tail: warn and stop, do NOT propagate the error
+        // (otherwise the server can never restart on a partially-trashed AOF).
+        match parser::parse(&mut buf) {
+            Ok(None) => {
                 tracing::warn!(remaining = buf.len(), "AOF truncated mid-frame; stopping replay");
                 break;
             }
-            Some(frame) => match Command::from_frame(frame) {
+            Ok(Some(frame)) => match Command::from_frame(frame) {
                 Ok(cmd) => {
                     let _ = cmd.apply(db);
                     applied += 1;
@@ -66,6 +68,10 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
                     tracing::warn!(?e, "skipping bad frame during AOF replay");
                 }
             },
+            Err(e) => {
+                tracing::warn!(?e, remaining = buf.len(), "AOF parse error; stopping replay");
+                break;
+            }
         }
     }
     tracing::info!(applied, ?path, "AOF replay done");

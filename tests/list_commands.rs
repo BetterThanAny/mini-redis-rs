@@ -167,6 +167,40 @@ async fn lpush_on_string_key_wrongtype() {
 }
 
 #[tokio::test]
+async fn lrange_start_beyond_end_returns_empty() {
+    // Regression for C1: previously returned a 1-element array because clamp wrongly
+    // pinned start to len-1.
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    send(&mut s, &array(&[b"RPUSH", b"l", b"a", b"b", b"c"])).await;
+    let _ = read_n(&mut s, 4).await;
+    send(&mut s, &array(&[b"LRANGE", b"l", b"5", b"10"])).await;
+    assert_eq!(read_n(&mut s, 4).await, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn lrange_negative_stop_before_list_returns_empty() {
+    // -100 on a 3-elem list resolves to "before index 0" -> empty.
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    send(&mut s, &array(&[b"RPUSH", b"l", b"a", b"b", b"c"])).await;
+    let _ = read_n(&mut s, 4).await;
+    send(&mut s, &array(&[b"LRANGE", b"l", b"-100", b"-50"])).await;
+    assert_eq!(read_n(&mut s, 4).await, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn lpop_with_count_zero_returns_empty_array() {
+    // Regression for H4: previously returned $-1\r\n.
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    send(&mut s, &array(&[b"RPUSH", b"l", b"a"])).await;
+    let _ = read_n(&mut s, 4).await;
+    send(&mut s, &array(&[b"LPOP", b"l", b"0"])).await;
+    assert_eq!(read_n(&mut s, 4).await, b"*0\r\n");
+}
+
+#[tokio::test]
 async fn pop_empties_then_del_via_pop() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();

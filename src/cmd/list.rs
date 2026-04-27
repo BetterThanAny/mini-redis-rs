@@ -72,10 +72,11 @@ fn pop(db: &Db, key: &Bytes, count: Option<usize>, side: PopSide) -> Frame {
     };
     let n = count.unwrap_or(1).min(list.len());
     if n == 0 {
-        // empty list -> null/empty array depending on form
+        // LPOP key (no count) on empty list -> null bulk
+        // LPOP key 0 (or count > 0 on empty list) -> empty array
         return match count {
             None => Frame::Null,
-            Some(_) => Frame::Null,
+            Some(_) => Frame::Array(vec![]),
         };
     }
     let mut popped = Vec::with_capacity(n);
@@ -134,12 +135,20 @@ pub fn lrange(db: &Db, key: &Bytes, start: i64, stop: i64) -> Frame {
         Value::List(l) => l,
         _ => return Frame::Error(WRONGTYPE.into()),
     };
-    let len = list.len();
+    let len = list.len() as i64;
     if len == 0 {
         return Frame::Array(vec![]);
     }
-    let start_idx = clamp_lrange_idx(start, len);
-    let stop_idx = clamp_lrange_idx(stop, len);
+    // Resolve negatives (no clamping yet so we can detect "outside the list").
+    let resolve = |i: i64| if i < 0 { len + i } else { i };
+    let start_r = resolve(start);
+    let stop_r = resolve(stop);
+    // start past end, or stop entirely before start of list -> empty
+    if start_r >= len || stop_r < 0 {
+        return Frame::Array(vec![]);
+    }
+    let start_idx = start_r.max(0) as usize;
+    let stop_idx = stop_r.min(len - 1) as usize;
     if start_idx > stop_idx {
         return Frame::Array(vec![]);
     }
@@ -150,12 +159,6 @@ pub fn lrange(db: &Db, key: &Bytes, start: i64, stop: i64) -> Frame {
         .map(|b| Frame::Bulk(b.clone()))
         .collect();
     Frame::Array(frames)
-}
-
-fn clamp_lrange_idx(i: i64, len: usize) -> usize {
-    let len_i = len as i64;
-    let resolved = if i < 0 { (len_i + i).max(0) } else { i.min(len_i - 1).max(0) };
-    resolved as usize
 }
 
 pub fn llen(db: &Db, key: &Bytes) -> Frame {
