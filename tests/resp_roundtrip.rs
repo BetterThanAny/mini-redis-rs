@@ -1,0 +1,134 @@
+use bytes::{Bytes, BytesMut};
+use mini_redis_rs::resp::{encoder, parser, Frame};
+
+fn roundtrip(frame: Frame) {
+    let mut buf = BytesMut::new();
+    encoder::encode(&frame, &mut buf);
+    let parsed = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(frame, parsed);
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn simple_string() {
+    roundtrip(Frame::Simple("OK".into()));
+}
+
+#[test]
+fn error_string() {
+    roundtrip(Frame::Error("ERR something bad".into()));
+}
+
+#[test]
+fn integer_positive() {
+    roundtrip(Frame::Integer(42));
+}
+
+#[test]
+fn integer_negative() {
+    roundtrip(Frame::Integer(-42));
+}
+
+#[test]
+fn integer_zero() {
+    roundtrip(Frame::Integer(0));
+}
+
+#[test]
+fn bulk_string() {
+    roundtrip(Frame::Bulk(Bytes::from_static(b"hello world")));
+}
+
+#[test]
+fn empty_bulk() {
+    roundtrip(Frame::Bulk(Bytes::new()));
+}
+
+#[test]
+fn binary_bulk() {
+    roundtrip(Frame::Bulk(Bytes::from_static(b"\x00\x01\xff\r\n")));
+}
+
+#[test]
+fn null_bulk() {
+    roundtrip(Frame::Null);
+}
+
+#[test]
+fn empty_array() {
+    roundtrip(Frame::Array(vec![]));
+}
+
+#[test]
+fn nested_array() {
+    roundtrip(Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"SET")),
+        Frame::Bulk(Bytes::from_static(b"k")),
+        Frame::Bulk(Bytes::from_static(b"v")),
+    ]));
+}
+
+#[test]
+fn deeply_nested_array() {
+    roundtrip(Frame::Array(vec![
+        Frame::Integer(1),
+        Frame::Array(vec![
+            Frame::Simple("nested".into()),
+            Frame::Bulk(Bytes::from_static(b"value")),
+        ]),
+        Frame::Null,
+    ]));
+}
+
+#[test]
+fn incomplete_simple_returns_none() {
+    let mut buf = BytesMut::from(&b"+PON"[..]);
+    assert!(parser::parse(&mut buf).unwrap().is_none());
+    assert_eq!(&buf[..], b"+PON");
+}
+
+#[test]
+fn incomplete_bulk_returns_none() {
+    let mut buf = BytesMut::from(&b"*2\r\n$3\r\nSET\r\n$3\r\nfo"[..]);
+    assert!(parser::parse(&mut buf).unwrap().is_none());
+    assert_eq!(&buf[..], b"*2\r\n$3\r\nSET\r\n$3\r\nfo");
+}
+
+#[test]
+fn incomplete_array_count_returns_none() {
+    let mut buf = BytesMut::from(&b"*"[..]);
+    assert!(parser::parse(&mut buf).unwrap().is_none());
+}
+
+#[test]
+fn streaming_partial_then_complete() {
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(b"*1\r\n$4\r\nPI");
+    assert!(parser::parse(&mut buf).unwrap().is_none());
+    // simulate more bytes arriving
+    buf.extend_from_slice(b"NG\r\n");
+    let f = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(
+        f,
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))])
+    );
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn bad_type_byte_errors() {
+    let mut buf = BytesMut::from(&b"@bogus\r\n"[..]);
+    assert!(parser::parse(&mut buf).is_err());
+}
+
+#[test]
+fn back_to_back_frames() {
+    let mut buf = BytesMut::new();
+    encoder::encode(&Frame::Integer(1), &mut buf);
+    encoder::encode(&Frame::Integer(2), &mut buf);
+    let f1 = parser::parse(&mut buf).unwrap().unwrap();
+    let f2 = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(f1, Frame::Integer(1));
+    assert_eq!(f2, Frame::Integer(2));
+    assert!(buf.is_empty());
+}

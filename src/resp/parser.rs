@@ -1,0 +1,101 @@
+use super::{Error, Frame};
+use bytes::{Buf, Bytes, BytesMut};
+
+pub fn parse(buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
+    let mut cursor = std::io::Cursor::new(&buf[..]);
+    match parse_frame(&mut cursor) {
+        Ok(frame) => {
+            let n = cursor.position() as usize;
+            buf.advance(n);
+            Ok(Some(frame))
+        }
+        Err(Error::Incomplete) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_frame(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
+    let tag = read_u8(c)?;
+    match tag {
+        b'+' => Ok(Frame::Simple(read_line_string(c)?)),
+        b'-' => Ok(Frame::Error(read_line_string(c)?)),
+        b':' => Ok(Frame::Integer(read_line_int(c)?)),
+        b'$' => parse_bulk(c),
+        b'*' => parse_array(c),
+        other => Err(Error::Protocol(format!("invalid type byte: 0x{other:02x}"))),
+    }
+}
+
+fn parse_bulk(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
+    let len = read_line_int(c)?;
+    if len == -1 {
+        return Ok(Frame::Null);
+    }
+    let len = usize::try_from(len).map_err(|_| Error::Protocol("negative bulk len".into()))?;
+    let remaining = c.get_ref().len() - c.position() as usize;
+    if remaining < len + 2 {
+        return Err(Error::Incomplete);
+    }
+    let start = c.position() as usize;
+    let bytes = Bytes::copy_from_slice(&c.get_ref()[start..start + len]);
+    c.set_position((start + len) as u64);
+    if read_u8(c)? != b'\r' || read_u8(c)? != b'\n' {
+        return Err(Error::Protocol("missing CRLF after bulk".into()));
+    }
+    Ok(Frame::Bulk(bytes))
+}
+
+fn parse_array(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
+    let count = read_line_int(c)?;
+    if count == -1 {
+        return Ok(Frame::Null);
+    }
+    let count = usize::try_from(count).map_err(|_| Error::Protocol("negative array len".into()))?;
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        items.push(parse_frame(c)?);
+    }
+    Ok(Frame::Array(items))
+}
+
+fn read_u8(c: &mut std::io::Cursor<&[u8]>) -> Result<u8, Error> {
+    if !c.has_remaining() {
+        return Err(Error::Incomplete);
+    }
+    Ok(c.get_u8())
+}
+
+fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
+    if buf.len() < start + 2 {
+        return None;
+    }
+    for i in start..buf.len().saturating_sub(1) {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn read_line<'a>(c: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a [u8], Error> {
+    let start = c.position() as usize;
+    let buf: &'a [u8] = *c.get_ref();
+    let crlf = find_crlf(buf, start).ok_or(Error::Incomplete)?;
+    c.set_position((crlf + 2) as u64);
+    Ok(&buf[start..crlf])
+}
+
+fn read_line_string(c: &mut std::io::Cursor<&[u8]>) -> Result<String, Error> {
+    let line = read_line(c)?;
+    std::str::from_utf8(line)
+        .map(|s| s.to_string())
+        .map_err(|_| Error::Protocol("invalid utf8 in line".into()))
+}
+
+fn read_line_int(c: &mut std::io::Cursor<&[u8]>) -> Result<i64, Error> {
+    let line = read_line(c)?;
+    std::str::from_utf8(line)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::Protocol("invalid integer".into()))
+}
