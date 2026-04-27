@@ -12,6 +12,7 @@ const SHARDS: usize = 16;
 pub enum Value {
     String(Bytes),
     List(VecDeque<Bytes>),
+    Hash(HashMap<Bytes, Bytes>),
 }
 
 #[derive(Debug)]

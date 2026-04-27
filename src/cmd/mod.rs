@@ -1,3 +1,4 @@
+pub mod hash;
 pub mod list;
 pub mod string;
 
@@ -34,6 +35,15 @@ pub enum Command {
     LRange(Bytes, i64, i64),
     LLen(Bytes),
     LIndex(Bytes, i64),
+    HSet(Bytes, Vec<(Bytes, Bytes)>),
+    HGet(Bytes, Bytes),
+    HDel(Bytes, Vec<Bytes>),
+    HKeys(Bytes),
+    HVals(Bytes),
+    HGetAll(Bytes),
+    HExists(Bytes, Bytes),
+    HLen(Bytes),
+    HIncrBy(Bytes, Bytes, i64),
     Unknown(String),
 }
 
@@ -166,6 +176,55 @@ impl Command {
                 let idx = parse_i64(&it.next().unwrap())?;
                 Ok(Command::LIndex(key, idx))
             }
+            "HSET" => {
+                if rest.len() < 3 || (rest.len() - 1) % 2 != 0 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                let key = it.next().unwrap();
+                let mut pairs = Vec::with_capacity(it.len() / 2);
+                while let (Some(f), Some(v)) = (it.next(), it.next()) {
+                    pairs.push((f, v));
+                }
+                Ok(Command::HSet(key, pairs))
+            }
+            "HGET" => {
+                if rest.len() != 2 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                Ok(Command::HGet(it.next().unwrap(), it.next().unwrap()))
+            }
+            "HDEL" => {
+                if rest.len() < 2 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                let key = it.next().unwrap();
+                let fields: Vec<Bytes> = it.collect();
+                Ok(Command::HDel(key, fields))
+            }
+            "HKEYS" => one_arg(rest, &name).map(Command::HKeys),
+            "HVALS" => one_arg(rest, &name).map(Command::HVals),
+            "HGETALL" => one_arg(rest, &name).map(Command::HGetAll),
+            "HEXISTS" => {
+                if rest.len() != 2 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                Ok(Command::HExists(it.next().unwrap(), it.next().unwrap()))
+            }
+            "HLEN" => one_arg(rest, &name).map(Command::HLen),
+            "HINCRBY" => {
+                if rest.len() != 3 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                let key = it.next().unwrap();
+                let field = it.next().unwrap();
+                let n = parse_i64(&it.next().unwrap())?;
+                Ok(Command::HIncrBy(key, field, n))
+            }
             other => Ok(Command::Unknown(other.to_string())),
         }
     }
@@ -202,6 +261,15 @@ impl Command {
             Command::LRange(k, s, e) => list::lrange(db, &k, s, e),
             Command::LLen(k) => list::llen(db, &k),
             Command::LIndex(k, i) => list::lindex(db, &k, i),
+            Command::HSet(k, pairs) => hash::hset(db, k, pairs),
+            Command::HGet(k, f) => hash::hget(db, &k, &f),
+            Command::HDel(k, fs) => hash::hdel(db, &k, &fs),
+            Command::HKeys(k) => hash::hkeys(db, &k),
+            Command::HVals(k) => hash::hvals(db, &k),
+            Command::HGetAll(k) => hash::hgetall(db, &k),
+            Command::HExists(k, f) => hash::hexists(db, &k, &f),
+            Command::HLen(k) => hash::hlen(db, &k),
+            Command::HIncrBy(k, f, n) => hash::hincrby(db, k, f, n),
             Command::Unknown(name) => Frame::Error(format!("ERR unknown command '{}'", name)),
         }
     }
