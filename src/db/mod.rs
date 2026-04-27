@@ -1,5 +1,7 @@
+pub mod expire;
+
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use xxhash_rust::xxh64::xxh64;
@@ -20,6 +22,7 @@ pub struct Entry {
 #[derive(Default, Debug)]
 pub struct Shard {
     pub entries: HashMap<Bytes, Entry>,
+    pub expirations: BTreeMap<Instant, Vec<Bytes>>,
 }
 
 #[derive(Clone)]
@@ -39,6 +42,10 @@ impl Db {
     pub fn shard_for(&self, key: &[u8]) -> &Mutex<Shard> {
         let idx = (xxh64(key, 0) as usize) % SHARDS;
         &self.shards[idx]
+    }
+
+    pub fn iter_shards(&self) -> impl Iterator<Item = &Mutex<Shard>> {
+        self.shards.iter()
     }
 }
 

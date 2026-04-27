@@ -1,7 +1,7 @@
 use crate::db::{entry_expired, Db, Entry, Value};
 use crate::resp::Frame;
 use bytes::Bytes;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 const NOT_INT: &str = "ERR value is not an integer or out of range";
@@ -19,15 +19,19 @@ pub fn get(db: &Db, key: &Bytes) -> Frame {
     }
 }
 
-pub fn set(db: &Db, key: Bytes, value: Bytes, expires_at: Option<Instant>) -> Frame {
+pub fn set(db: &Db, key: Bytes, value: Bytes, ex: Option<Duration>) -> Frame {
+    let expires_at = ex.map(|d| Instant::now() + d);
     let mut shard = db.shard_for(&key).lock().unwrap();
     shard.entries.insert(
-        key,
+        key.clone(),
         Entry {
             value: Value::String(value),
             expires_at,
         },
     );
+    if let Some(t) = expires_at {
+        shard.expirations.entry(t).or_default().push(key);
+    }
     Frame::Simple("OK".into())
 }
 
@@ -145,4 +149,57 @@ pub fn mset(db: &Db, pairs: Vec<(Bytes, Bytes)>) -> Frame {
         );
     }
     Frame::Simple("OK".into())
+}
+
+// ---- expiration commands ----
+
+pub fn expire(db: &Db, key: Bytes, ttl: Duration) -> Frame {
+    let deadline = Instant::now() + ttl;
+    let mut shard = db.shard_for(&key).lock().unwrap();
+    if !shard.entries.contains_key(&key) {
+        return Frame::Integer(0);
+    }
+    if let Some(entry) = shard.entries.get_mut(&key) {
+        entry.expires_at = Some(deadline);
+    }
+    shard.expirations.entry(deadline).or_default().push(key);
+    Frame::Integer(1)
+}
+
+pub fn ttl(db: &Db, key: &Bytes, in_ms: bool) -> Frame {
+    let shard = db.shard_for(key).lock().unwrap();
+    match shard.entries.get(key) {
+        None => Frame::Integer(-2),
+        Some(entry) => match entry.expires_at {
+            None => Frame::Integer(-1),
+            Some(t) => {
+                let now = Instant::now();
+                if t <= now {
+                    Frame::Integer(-2)
+                } else {
+                    let remaining = t - now;
+                    if in_ms {
+                        Frame::Integer(remaining.as_millis() as i64)
+                    } else {
+                        // Round up partial seconds so e.g. 1.2s remaining returns 2,
+                        // matching Redis semantics for fresh `EXPIRE k 30`.
+                        let secs = remaining.as_secs() as i64
+                            + i64::from(remaining.subsec_millis() > 0);
+                        Frame::Integer(secs)
+                    }
+                }
+            }
+        },
+    }
+}
+
+pub fn persist(db: &Db, key: &Bytes) -> Frame {
+    let mut shard = db.shard_for(key).lock().unwrap();
+    match shard.entries.get_mut(key) {
+        Some(entry) if entry.expires_at.is_some() => {
+            entry.expires_at = None;
+            Frame::Integer(1)
+        }
+        _ => Frame::Integer(0),
+    }
 }

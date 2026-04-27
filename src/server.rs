@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 pub async fn run(listener: TcpListener, shutdown: impl Future) -> anyhow::Result<()> {
     let db = Db::new();
+    tokio::spawn(crate::db::expire::run_sweeper(db.clone()));
     tokio::select! {
         res = accept_loop(listener, db) => res,
         _ = shutdown => {

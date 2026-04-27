@@ -3,13 +3,14 @@ pub mod string;
 use crate::db::Db;
 use crate::resp::Frame;
 use bytes::Bytes;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub enum Command {
     Ping(Option<Bytes>),
     Echo(Bytes),
     Get(Bytes),
-    Set(Bytes, Bytes),
+    Set { key: Bytes, value: Bytes, ex: Option<Duration> },
     Del(Vec<Bytes>),
     Exists(Vec<Bytes>),
     Incr(Bytes),
@@ -20,6 +21,11 @@ pub enum Command {
     Strlen(Bytes),
     MGet(Vec<Bytes>),
     MSet(Vec<(Bytes, Bytes)>),
+    Expire(Bytes, Duration),
+    PExpire(Bytes, Duration),
+    Ttl(Bytes),
+    PTtl(Bytes),
+    Persist(Bytes),
     Unknown(String),
 }
 
@@ -37,6 +43,8 @@ pub enum ParseError {
     BadName,
     #[error("value is not an integer or out of range")]
     NotInt,
+    #[error("syntax error")]
+    Syntax,
 }
 
 impl Command {
@@ -63,13 +71,7 @@ impl Command {
             },
             "ECHO" => one_arg(rest, &name).map(Command::Echo),
             "GET" => one_arg(rest, &name).map(Command::Get),
-            "SET" => {
-                if rest.len() != 2 {
-                    return Err(arity_err());
-                }
-                let mut it = rest.into_iter();
-                Ok(Command::Set(it.next().unwrap(), it.next().unwrap()))
-            }
+            "SET" => parse_set(rest, &name),
             "DEL" => {
                 if rest.is_empty() {
                     return Err(arity_err());
@@ -127,6 +129,11 @@ impl Command {
                 }
                 Ok(Command::MSet(pairs))
             }
+            "EXPIRE" => parse_expire(rest, &name, /* ms */ false).map(|(k, d)| Command::Expire(k, d)),
+            "PEXPIRE" => parse_expire(rest, &name, /* ms */ true).map(|(k, d)| Command::PExpire(k, d)),
+            "TTL" => one_arg(rest, &name).map(Command::Ttl),
+            "PTTL" => one_arg(rest, &name).map(Command::PTtl),
+            "PERSIST" => one_arg(rest, &name).map(Command::Persist),
             other => Ok(Command::Unknown(other.to_string())),
         }
     }
@@ -137,7 +144,7 @@ impl Command {
             Command::Ping(Some(msg)) => Frame::Bulk(msg),
             Command::Echo(msg) => Frame::Bulk(msg),
             Command::Get(k) => string::get(db, &k),
-            Command::Set(k, v) => string::set(db, k, v, None),
+            Command::Set { key, value, ex } => string::set(db, key, value, ex),
             Command::Del(keys) => string::del(db, &keys),
             Command::Exists(keys) => string::exists(db, &keys),
             Command::Incr(k) => string::incr(db, k, 1),
@@ -151,9 +158,71 @@ impl Command {
             Command::Strlen(k) => string::strlen(db, &k),
             Command::MGet(keys) => string::mget(db, &keys),
             Command::MSet(pairs) => string::mset(db, pairs),
+            Command::Expire(k, d) => string::expire(db, k, d),
+            Command::PExpire(k, d) => string::expire(db, k, d),
+            Command::Ttl(k) => string::ttl(db, &k, false),
+            Command::PTtl(k) => string::ttl(db, &k, true),
+            Command::Persist(k) => string::persist(db, &k),
             Command::Unknown(name) => Frame::Error(format!("ERR unknown command '{}'", name)),
         }
     }
+}
+
+fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
+    if rest.len() < 2 {
+        return Err(ParseError::Arity(name.to_string()));
+    }
+    let mut it = rest.into_iter();
+    let key = it.next().unwrap();
+    let value = it.next().unwrap();
+    let mut ex: Option<Duration> = None;
+    while let Some(opt) = it.next() {
+        let opt_upper = std::str::from_utf8(&opt)
+            .map_err(|_| ParseError::Syntax)?
+            .to_ascii_uppercase();
+        match opt_upper.as_str() {
+            "EX" => {
+                let n_bytes = it.next().ok_or(ParseError::Syntax)?;
+                let n = parse_i64(&n_bytes)?;
+                if n <= 0 {
+                    return Err(ParseError::Syntax);
+                }
+                ex = Some(Duration::from_secs(n as u64));
+            }
+            "PX" => {
+                let n_bytes = it.next().ok_or(ParseError::Syntax)?;
+                let n = parse_i64(&n_bytes)?;
+                if n <= 0 {
+                    return Err(ParseError::Syntax);
+                }
+                ex = Some(Duration::from_millis(n as u64));
+            }
+            _ => return Err(ParseError::Syntax),
+        }
+    }
+    Ok(Command::Set { key, value, ex })
+}
+
+fn parse_expire(
+    rest: Vec<Bytes>,
+    name: &str,
+    ms: bool,
+) -> Result<(Bytes, Duration), ParseError> {
+    if rest.len() != 2 {
+        return Err(ParseError::Arity(name.to_string()));
+    }
+    let mut it = rest.into_iter();
+    let key = it.next().unwrap();
+    let n = parse_i64(&it.next().unwrap())?;
+    if n < 0 {
+        return Err(ParseError::Syntax);
+    }
+    let dur = if ms {
+        Duration::from_millis(n as u64)
+    } else {
+        Duration::from_secs(n as u64)
+    };
+    Ok((key, dur))
 }
 
 fn one_arg(rest: Vec<Bytes>, name: &str) -> Result<Bytes, ParseError> {
