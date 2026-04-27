@@ -1,5 +1,7 @@
+use crate::cmd::Command;
+use crate::connection::Connection;
+use crate::resp::Frame;
 use std::future::Future;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 pub async fn run(listener: TcpListener, shutdown: impl Future) -> anyhow::Result<()> {
@@ -14,21 +16,24 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) -> anyhow::Result
 
 async fn accept_loop(listener: TcpListener) -> anyhow::Result<()> {
     loop {
-        let (mut socket, peer) = listener.accept().await?;
+        let (socket, peer) = listener.accept().await?;
         tracing::debug!(?peer, "accepted");
         tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                match socket.read(&mut buf).await {
-                    Ok(0) => return,
-                    Ok(n) => {
-                        if socket.write_all(&buf[..n]).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
+            if let Err(e) = handle(socket).await {
+                tracing::warn!(?peer, error = %e, "connection ended with error");
             }
         });
     }
+}
+
+async fn handle(socket: tokio::net::TcpStream) -> anyhow::Result<()> {
+    let mut conn = Connection::new(socket);
+    while let Some(frame) = conn.read_frame().await? {
+        let response = match Command::from_frame(frame) {
+            Ok(cmd) => cmd.apply(),
+            Err(e) => Frame::Error(format!("ERR {}", e)),
+        };
+        conn.write_frame(&response).await?;
+    }
+    Ok(())
 }
