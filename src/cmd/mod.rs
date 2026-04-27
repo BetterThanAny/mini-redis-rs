@@ -44,7 +44,16 @@ pub enum Command {
     HExists(Bytes, Bytes),
     HLen(Bytes),
     HIncrBy(Bytes, Bytes, i64),
+    Subscribe(Vec<Bytes>),
+    Unsubscribe(Option<Vec<Bytes>>),
+    Publish(Bytes, Bytes),
     Unknown(String),
+}
+
+impl Command {
+    pub fn is_subscribe(&self) -> bool {
+        matches!(self, Command::Subscribe(_))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -225,6 +234,26 @@ impl Command {
                 let n = parse_i64(&it.next().unwrap())?;
                 Ok(Command::HIncrBy(key, field, n))
             }
+            "SUBSCRIBE" => {
+                if rest.is_empty() {
+                    return Err(arity_err());
+                }
+                Ok(Command::Subscribe(rest))
+            }
+            "UNSUBSCRIBE" => {
+                if rest.is_empty() {
+                    Ok(Command::Unsubscribe(None))
+                } else {
+                    Ok(Command::Unsubscribe(Some(rest)))
+                }
+            }
+            "PUBLISH" => {
+                if rest.len() != 2 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                Ok(Command::Publish(it.next().unwrap(), it.next().unwrap()))
+            }
             other => Ok(Command::Unknown(other.to_string())),
         }
     }
@@ -270,6 +299,12 @@ impl Command {
             Command::HExists(k, f) => hash::hexists(db, &k, &f),
             Command::HLen(k) => hash::hlen(db, &k),
             Command::HIncrBy(k, f, n) => hash::hincrby(db, k, f, n),
+            Command::Publish(ch, msg) => Frame::Integer(db.pubsub_publish(&ch, msg) as i64),
+            // SUBSCRIBE / UNSUBSCRIBE are handled by the connection task itself,
+            // not via this synchronous apply() path.
+            Command::Subscribe(_) | Command::Unsubscribe(_) => {
+                Frame::Error("ERR SUBSCRIBE/UNSUBSCRIBE must be handled by connection".into())
+            }
             Command::Unknown(name) => Frame::Error(format!("ERR unknown command '{}'", name)),
         }
     }

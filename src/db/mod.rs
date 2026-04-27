@@ -4,9 +4,11 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::broadcast;
 use xxhash_rust::xxh64::xxh64;
 
 const SHARDS: usize = 16;
+const PUBSUB_CHAN_CAP: usize = 1024;
 
 #[derive(Debug)]
 pub enum Value {
@@ -30,6 +32,7 @@ pub struct Shard {
 #[derive(Clone)]
 pub struct Db {
     shards: Arc<Vec<Mutex<Shard>>>,
+    pubsub: Arc<Mutex<HashMap<Bytes, broadcast::Sender<Bytes>>>>,
 }
 
 impl Db {
@@ -38,7 +41,10 @@ impl Db {
         for _ in 0..SHARDS {
             v.push(Mutex::new(Shard::default()));
         }
-        Self { shards: Arc::new(v) }
+        Self {
+            shards: Arc::new(v),
+            pubsub: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn shard_for(&self, key: &[u8]) -> &Mutex<Shard> {
@@ -48,6 +54,30 @@ impl Db {
 
     pub fn iter_shards(&self) -> impl Iterator<Item = &Mutex<Shard>> {
         self.shards.iter()
+    }
+
+    /// Subscribe to a channel; returns a fresh receiver. Creates the channel if missing.
+    pub fn pubsub_subscribe(&self, channel: Bytes) -> broadcast::Receiver<Bytes> {
+        let mut ps = self.pubsub.lock().unwrap();
+        let tx = ps
+            .entry(channel)
+            .or_insert_with(|| broadcast::channel(PUBSUB_CHAN_CAP).0);
+        tx.subscribe()
+    }
+
+    /// Send a message to all current subscribers of `channel`. Returns number of receivers.
+    pub fn pubsub_publish(&self, channel: &Bytes, msg: Bytes) -> usize {
+        let mut ps = self.pubsub.lock().unwrap();
+        match ps.get(channel) {
+            Some(tx) => {
+                let r = tx.send(msg).unwrap_or(0);
+                if tx.receiver_count() == 0 {
+                    ps.remove(channel);
+                }
+                r
+            }
+            None => 0,
+        }
     }
 }
 
