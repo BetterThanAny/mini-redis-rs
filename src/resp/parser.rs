@@ -69,17 +69,12 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
     if buf.len() < start + 2 {
         return None;
     }
-    for i in start..buf.len().saturating_sub(1) {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            return Some(i);
-        }
-    }
-    None
+    (start..buf.len().saturating_sub(1)).find(|&i| buf[i] == b'\r' && buf[i + 1] == b'\n')
 }
 
 fn read_line<'a>(c: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a [u8], Error> {
     let start = c.position() as usize;
-    let buf: &'a [u8] = *c.get_ref();
+    let buf: &'a [u8] = c.get_ref();
     let crlf = find_crlf(buf, start).ok_or(Error::Incomplete)?;
     c.set_position((crlf + 2) as u64);
     Ok(&buf[start..crlf])
