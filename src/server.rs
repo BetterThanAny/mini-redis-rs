@@ -156,8 +156,15 @@ async fn run_subscribed(
         }
     }
 
+    let channels: Vec<Bytes> = tasks.keys().cloned().collect();
     for (_, h) in tasks {
         h.abort();
+    }
+    // Yield once so the aborted forwarder tasks actually drop their broadcast::Receivers
+    // before we try to GC the channels (best-effort; pubsub_publish also GCs lazily).
+    tokio::task::yield_now().await;
+    for ch in &channels {
+        db.pubsub_gc(ch);
     }
     Ok(())
 }

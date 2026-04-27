@@ -29,6 +29,20 @@ pub struct Shard {
     pub expirations: BTreeMap<Instant, Vec<Bytes>>,
 }
 
+impl Shard {
+    /// Remove `key` from the expiration index at deadline `t`. No-op if missing.
+    /// Call this *before* writing a new deadline (or in PERSIST) so the BTreeMap
+    /// stays bounded even under repeated SET EX / EXPIRE / PERSIST churn.
+    pub fn unindex_expiration(&mut self, t: Instant, key: &Bytes) {
+        if let Some(keys) = self.expirations.get_mut(&t) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.expirations.remove(&t);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Db {
     shards: Arc<Vec<Mutex<Shard>>>,
@@ -78,6 +92,22 @@ impl Db {
             }
             None => 0,
         }
+    }
+
+    /// Drop a channel's broadcast::Sender if no receivers remain.
+    /// Called on connection close to prevent orphan channels accumulating.
+    pub fn pubsub_gc(&self, channel: &Bytes) {
+        let mut ps = self.pubsub.lock().unwrap();
+        if let Some(tx) = ps.get(channel) {
+            if tx.receiver_count() == 0 {
+                ps.remove(channel);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn pubsub_channel_count(&self) -> usize {
+        self.pubsub.lock().unwrap().len()
     }
 }
 

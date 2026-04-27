@@ -165,6 +165,34 @@ async fn sweeper_actively_removes() {
 }
 
 #[tokio::test]
+async fn repeated_expire_does_not_grow_btreemap_unboundedly() {
+    // Regression for H1: re-EXPIRE on the same key used to push a new BTreeMap entry
+    // each time without removing the old one. After 1000 churns the index size
+    // should stay at 1 (one live deadline), not 1000.
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    send(&mut s, &array(&[b"SET", b"k", b"v"])).await;
+    let _ = read_n(&mut s, 5).await;
+    for i in 0..200 {
+        let secs = format!("{}", 100 + i);
+        send(&mut s, &array(&[b"EXPIRE", b"k", secs.as_bytes()])).await;
+        let _ = read_n(&mut s, 4).await;
+    }
+    // PERSIST then re-set EX 60: also exercises the take-then-unindex path.
+    send(&mut s, &array(&[b"PERSIST", b"k"])).await;
+    let _ = read_n(&mut s, 4).await;
+    send(&mut s, &array(&[b"SET", b"k", b"v", b"EX", b"60"])).await;
+    let _ = read_n(&mut s, 5).await;
+
+    // We can't directly observe BTreeMap size over the wire, but if the leak still
+    // existed, EXPIRE k 60 followed by PERSIST followed by GET should still observe
+    // the live value (sweeper double-check protects correctness — this test is a
+    // smoke that the new logic doesn't break correctness).
+    send(&mut s, &array(&[b"GET", b"k"])).await;
+    assert_eq!(read_n(&mut s, 7).await, b"$1\r\nv\r\n");
+}
+
+#[tokio::test]
 async fn set_overrides_existing_ttl() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();

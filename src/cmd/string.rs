@@ -21,6 +21,11 @@ pub fn get(db: &Db, key: &Bytes) -> Frame {
 pub fn set(db: &Db, key: Bytes, value: Bytes, ex: Option<Duration>) -> Frame {
     let expires_at = ex.map(|d| Instant::now() + d);
     let mut shard = db.shard_for(&key).lock().unwrap();
+    // If overwriting an entry that had a TTL, drop the stale BTreeMap row
+    // so the index doesn't grow unboundedly under SET EX / EXPIRE churn.
+    if let Some(old) = shard.entries.get(&key).and_then(|e| e.expires_at) {
+        shard.unindex_expiration(old, &key);
+    }
     shard.entries.insert(
         key.clone(),
         Entry {
@@ -154,6 +159,9 @@ pub fn expire(db: &Db, key: Bytes, ttl: Duration) -> Frame {
     if !shard.entries.contains_key(&key) {
         return Frame::Integer(0);
     }
+    if let Some(old) = shard.entries.get(&key).and_then(|e| e.expires_at) {
+        shard.unindex_expiration(old, &key);
+    }
     if let Some(entry) = shard.entries.get_mut(&key) {
         entry.expires_at = Some(deadline);
     }
@@ -190,11 +198,10 @@ pub fn ttl(db: &Db, key: &Bytes, in_ms: bool) -> Frame {
 
 pub fn persist(db: &Db, key: &Bytes) -> Frame {
     let mut shard = db.shard_for(key).lock().unwrap();
-    match shard.entries.get_mut(key) {
-        Some(entry) if entry.expires_at.is_some() => {
-            entry.expires_at = None;
-            Frame::Integer(1)
-        }
-        _ => Frame::Integer(0),
-    }
+    let old = match shard.entries.get_mut(key) {
+        Some(entry) if entry.expires_at.is_some() => entry.expires_at.take().unwrap(),
+        _ => return Frame::Integer(0),
+    };
+    shard.unindex_expiration(old, key);
+    Frame::Integer(1)
 }
