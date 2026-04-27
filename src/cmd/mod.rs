@@ -54,6 +54,32 @@ impl Command {
     pub fn is_subscribe(&self) -> bool {
         matches!(self, Command::Subscribe(_))
     }
+
+    /// Whether this command mutates persisted state (i.e. should be written to AOF).
+    pub fn is_write(&self) -> bool {
+        use Command::*;
+        matches!(
+            self,
+            Set { .. }
+                | Del(_)
+                | Incr(_)
+                | Decr(_)
+                | IncrBy(_, _)
+                | DecrBy(_, _)
+                | Append(_, _)
+                | MSet(_)
+                | Expire(_, _)
+                | PExpire(_, _)
+                | Persist(_)
+                | LPush(_, _)
+                | RPush(_, _)
+                | LPop(_, _)
+                | RPop(_, _)
+                | HSet(_, _)
+                | HDel(_, _)
+                | HIncrBy(_, _, _)
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -1,3 +1,4 @@
+use crate::aof::AofHandle;
 use crate::cmd::Command;
 use crate::connection::Connection;
 use crate::db::Db;
@@ -9,10 +10,18 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 pub async fn run(listener: TcpListener, shutdown: impl Future) -> anyhow::Result<()> {
-    let db = Db::new();
+    run_with_options(listener, Db::new(), None, shutdown).await
+}
+
+pub async fn run_with_options(
+    listener: TcpListener,
+    db: Db,
+    aof: Option<AofHandle>,
+    shutdown: impl Future,
+) -> anyhow::Result<()> {
     tokio::spawn(crate::db::expire::run_sweeper(db.clone()));
     tokio::select! {
-        res = accept_loop(listener, db) => res,
+        res = accept_loop(listener, db, aof) => res,
         _ = shutdown => {
             tracing::info!("shutdown signal received");
             Ok(())
@@ -20,30 +29,45 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) -> anyhow::Result
     }
 }
 
-async fn accept_loop(listener: TcpListener, db: Db) -> anyhow::Result<()> {
+async fn accept_loop(
+    listener: TcpListener,
+    db: Db,
+    aof: Option<AofHandle>,
+) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let db = db.clone();
+        let aof = aof.clone();
         tracing::debug!(?peer, "accepted");
         tokio::spawn(async move {
-            if let Err(e) = handle(socket, db).await {
+            if let Err(e) = handle(socket, db, aof).await {
                 tracing::warn!(?peer, error = %e, "connection ended with error");
             }
         });
     }
 }
 
-async fn handle(socket: tokio::net::TcpStream, db: Db) -> anyhow::Result<()> {
+async fn handle(
+    socket: tokio::net::TcpStream,
+    db: Db,
+    aof: Option<AofHandle>,
+) -> anyhow::Result<()> {
     let mut conn = Connection::new(socket);
     while let Some(frame) = conn.read_frame().await? {
+        let frame_for_aof = frame.clone();
         match Command::from_frame(frame) {
             Ok(Command::Subscribe(channels)) => {
                 run_subscribed(&mut conn, &db, channels).await?;
-                // After exit, return to normal mode
             }
             Ok(cmd) => {
+                let is_write = cmd.is_write();
                 let resp = cmd.apply(&db);
                 conn.write_frame(&resp).await?;
+                if is_write {
+                    if let Some(a) = &aof {
+                        a.write(&frame_for_aof);
+                    }
+                }
             }
             Err(e) => {
                 conn.write_frame(&Frame::Error(format!("ERR {}", e))).await?;
@@ -83,7 +107,6 @@ async fn run_subscribed(
                     Ok(Command::Unsubscribe(chs_opt)) => {
                         let chs = chs_opt.unwrap_or_else(|| tasks.keys().cloned().collect());
                         if chs.is_empty() {
-                            // No active subscriptions: still send a single ack with nil channel
                             conn.write_frame(&Frame::Array(vec![
                                 Frame::Bulk(Bytes::from_static(b"unsubscribe")),
                                 Frame::Null,
@@ -102,17 +125,13 @@ async fn run_subscribed(
                         }
                     }
                     Ok(Command::Ping(msg)) => {
-                        let payload = match msg {
-                            None => Bytes::new(),
-                            Some(m) => m,
-                        };
+                        let payload = msg.unwrap_or_default();
                         conn.write_frame(&Frame::Array(vec![
                             Frame::Bulk(Bytes::from_static(b"pong")),
                             Frame::Bulk(payload),
                         ])).await?;
                     }
                     Ok(Command::Publish(ch, msg)) => {
-                        // Publishing while subscribed is allowed
                         let n = db.pubsub_publish(&ch, msg);
                         conn.write_frame(&Frame::Integer(n as i64)).await?;
                     }
