@@ -1,7 +1,7 @@
 pub mod expire;
 
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use xxhash_rust::xxh64::xxh64;
@@ -11,6 +11,7 @@ const SHARDS: usize = 16;
 #[derive(Debug)]
 pub enum Value {
     String(Bytes),
+    List(VecDeque<Bytes>),
 }
 
 #[derive(Debug)]

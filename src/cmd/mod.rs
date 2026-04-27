@@ -1,3 +1,4 @@
+pub mod list;
 pub mod string;
 
 use crate::db::Db;
@@ -26,6 +27,13 @@ pub enum Command {
     Ttl(Bytes),
     PTtl(Bytes),
     Persist(Bytes),
+    LPush(Bytes, Vec<Bytes>),
+    RPush(Bytes, Vec<Bytes>),
+    LPop(Bytes, Option<usize>),
+    RPop(Bytes, Option<usize>),
+    LRange(Bytes, i64, i64),
+    LLen(Bytes),
+    LIndex(Bytes, i64),
     Unknown(String),
 }
 
@@ -134,6 +142,30 @@ impl Command {
             "TTL" => one_arg(rest, &name).map(Command::Ttl),
             "PTTL" => one_arg(rest, &name).map(Command::PTtl),
             "PERSIST" => one_arg(rest, &name).map(Command::Persist),
+            "LPUSH" => parse_push(rest, &name).map(|(k, v)| Command::LPush(k, v)),
+            "RPUSH" => parse_push(rest, &name).map(|(k, v)| Command::RPush(k, v)),
+            "LPOP" => parse_pop(rest, &name).map(|(k, c)| Command::LPop(k, c)),
+            "RPOP" => parse_pop(rest, &name).map(|(k, c)| Command::RPop(k, c)),
+            "LRANGE" => {
+                if rest.len() != 3 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                let key = it.next().unwrap();
+                let start = parse_i64(&it.next().unwrap())?;
+                let stop = parse_i64(&it.next().unwrap())?;
+                Ok(Command::LRange(key, start, stop))
+            }
+            "LLEN" => one_arg(rest, &name).map(Command::LLen),
+            "LINDEX" => {
+                if rest.len() != 2 {
+                    return Err(arity_err());
+                }
+                let mut it = rest.into_iter();
+                let key = it.next().unwrap();
+                let idx = parse_i64(&it.next().unwrap())?;
+                Ok(Command::LIndex(key, idx))
+            }
             other => Ok(Command::Unknown(other.to_string())),
         }
     }
@@ -163,6 +195,13 @@ impl Command {
             Command::Ttl(k) => string::ttl(db, &k, false),
             Command::PTtl(k) => string::ttl(db, &k, true),
             Command::Persist(k) => string::persist(db, &k),
+            Command::LPush(k, vs) => list::lpush(db, k, vs),
+            Command::RPush(k, vs) => list::rpush(db, k, vs),
+            Command::LPop(k, c) => list::lpop(db, &k, c),
+            Command::RPop(k, c) => list::rpop(db, &k, c),
+            Command::LRange(k, s, e) => list::lrange(db, &k, s, e),
+            Command::LLen(k) => list::llen(db, &k),
+            Command::LIndex(k, i) => list::lindex(db, &k, i),
             Command::Unknown(name) => Frame::Error(format!("ERR unknown command '{}'", name)),
         }
     }
@@ -223,6 +262,35 @@ fn parse_expire(
         Duration::from_secs(n as u64)
     };
     Ok((key, dur))
+}
+
+fn parse_push(rest: Vec<Bytes>, name: &str) -> Result<(Bytes, Vec<Bytes>), ParseError> {
+    if rest.len() < 2 {
+        return Err(ParseError::Arity(name.to_string()));
+    }
+    let mut it = rest.into_iter();
+    let key = it.next().unwrap();
+    let values: Vec<Bytes> = it.collect();
+    Ok((key, values))
+}
+
+fn parse_pop(rest: Vec<Bytes>, name: &str) -> Result<(Bytes, Option<usize>), ParseError> {
+    match rest.len() {
+        1 => {
+            let mut it = rest.into_iter();
+            Ok((it.next().unwrap(), None))
+        }
+        2 => {
+            let mut it = rest.into_iter();
+            let key = it.next().unwrap();
+            let count = parse_i64(&it.next().unwrap())?;
+            if count < 0 {
+                return Err(ParseError::Syntax);
+            }
+            Ok((key, Some(count as usize)))
+        }
+        _ => Err(ParseError::Arity(name.to_string())),
+    }
 }
 
 fn one_arg(rest: Vec<Bytes>, name: &str) -> Result<Bytes, ParseError> {

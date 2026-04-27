@@ -12,7 +12,6 @@ pub fn get(db: &Db, key: &Bytes) -> Frame {
     match shard.entries.get(key) {
         Some(entry) if !entry_expired(entry) => match &entry.value {
             Value::String(b) => Frame::Bulk(b.clone()),
-            #[allow(unreachable_patterns)]
             _ => Frame::Error(WRONGTYPE.into()),
         },
         _ => Frame::Null,
@@ -77,7 +76,6 @@ pub fn incr(db: &Db, key: Bytes, delta: i64) -> Frame {
             Some(n) => n,
             None => return Frame::Error(NOT_INT.into()),
         },
-        #[allow(unreachable_patterns)]
         _ => return Frame::Error(WRONGTYPE.into()),
     };
     let new = match current.checked_add(delta) {
@@ -102,7 +100,6 @@ pub fn append(db: &Db, key: Bytes, suffix: Bytes) -> Frame {
             *b = combined.freeze();
             Frame::Integer(b.len() as i64)
         }
-        #[allow(unreachable_patterns)]
         _ => Frame::Error(WRONGTYPE.into()),
     }
 }
@@ -112,7 +109,6 @@ pub fn strlen(db: &Db, key: &Bytes) -> Frame {
     match shard.entries.get(key) {
         Some(e) if !entry_expired(e) => match &e.value {
             Value::String(b) => Frame::Integer(b.len() as i64),
-            #[allow(unreachable_patterns)]
             _ => Frame::Error(WRONGTYPE.into()),
         },
         _ => Frame::Integer(0),
@@ -127,7 +123,6 @@ pub fn mget(db: &Db, keys: &[Bytes]) -> Frame {
             match shard.entries.get(k) {
                 Some(e) if !entry_expired(e) => match &e.value {
                     Value::String(b) => Frame::Bulk(b.clone()),
-                    #[allow(unreachable_patterns)]
                     _ => Frame::Null,
                 },
                 _ => Frame::Null,
