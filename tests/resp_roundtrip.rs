@@ -122,6 +122,21 @@ fn bad_type_byte_errors() {
 }
 
 #[test]
+fn array_length_above_cap_errors() {
+    // Without the cap, Vec::with_capacity would attempt to allocate ~tens of GB.
+    let mut buf = BytesMut::from(&b"*9999999999\r\n"[..]);
+    let err = parser::parse(&mut buf);
+    assert!(err.is_err(), "expected protocol error, got {err:?}");
+}
+
+#[test]
+fn bulk_length_above_cap_errors() {
+    let mut buf = BytesMut::from(&b"$9999999999\r\n"[..]);
+    let err = parser::parse(&mut buf);
+    assert!(err.is_err(), "expected protocol error, got {err:?}");
+}
+
+#[test]
 fn back_to_back_frames() {
     let mut buf = BytesMut::new();
     encoder::encode(&Frame::Integer(1), &mut buf);

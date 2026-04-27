@@ -331,7 +331,14 @@ impl Command {
             Command::Subscribe(_) | Command::Unsubscribe(_) => {
                 Frame::Error("ERR SUBSCRIBE/UNSUBSCRIBE must be handled by connection".into())
             }
-            Command::Unknown(name) => Frame::Error(format!("ERR unknown command '{}'", name)),
+            Command::Unknown(name) => {
+                // Sanitize CR/LF to avoid protocol injection — name is user-controlled.
+                let safe: String = name
+                    .chars()
+                    .map(|c| if c == '\r' || c == '\n' { '?' } else { c })
+                    .collect();
+                Frame::Error(format!("ERR unknown command '{}'", safe))
+            }
         }
     }
 }

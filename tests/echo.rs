@@ -73,6 +73,29 @@ async fn unknown_command_returns_error() {
 }
 
 #[tokio::test]
+async fn unknown_command_with_crlf_does_not_split_frame() {
+    // Regression for H2: a command name containing \r\n must not produce an Error
+    // frame that is interpreted as multiple frames by the client.
+    let (addr, _shutdown) = spawn_server().await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    // bulk payload is exactly 8 bytes: F O O \r \n B A R
+    sock.write_all(b"*1\r\n$8\r\nFOO\r\nBAR\r\n").await.unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = &buf[..n];
+    assert!(resp.starts_with(b"-ERR"), "got: {resp:?}");
+    // Body must not contain raw CR/LF (would let the response be parsed as 2 frames).
+    let body_end = resp.len() - 2; // strip trailing \r\n
+    assert!(
+        !resp[..body_end].contains(&b'\r') && !resp[..body_end].contains(&b'\n'),
+        "raw CR/LF found in error body: {resp:?}"
+    );
+}
+
+#[tokio::test]
 async fn case_insensitive_command_name() {
     let (addr, _shutdown) = spawn_server().await;
     let mut sock = TcpStream::connect(addr).await.unwrap();

@@ -1,6 +1,12 @@
 use super::{Error, Frame};
 use bytes::{Buf, Bytes, BytesMut};
 
+/// Mirrors Redis's `proto-max-bulk-len` default (512 MB).
+const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+/// Sensible cap on array length (1M elements) — without this a malicious
+/// `*999999999\r\n` would `Vec::with_capacity` ~tens of GB.
+const MAX_ARRAY_LEN: usize = 1024 * 1024;
+
 pub fn parse(buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
     let mut cursor = std::io::Cursor::new(&buf[..]);
     match parse_frame(&mut cursor) {
@@ -32,6 +38,11 @@ fn parse_bulk(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
         return Ok(Frame::Null);
     }
     let len = usize::try_from(len).map_err(|_| Error::Protocol("negative bulk len".into()))?;
+    if len > MAX_BULK_LEN {
+        return Err(Error::Protocol(format!(
+            "bulk length {len} exceeds limit {MAX_BULK_LEN}"
+        )));
+    }
     let remaining = c.get_ref().len() - c.position() as usize;
     if remaining < len + 2 {
         return Err(Error::Incomplete);
@@ -51,6 +62,11 @@ fn parse_array(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
         return Ok(Frame::Null);
     }
     let count = usize::try_from(count).map_err(|_| Error::Protocol("negative array len".into()))?;
+    if count > MAX_ARRAY_LEN {
+        return Err(Error::Protocol(format!(
+            "array length {count} exceeds limit {MAX_ARRAY_LEN}"
+        )));
+    }
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
         items.push(parse_frame(c)?);
