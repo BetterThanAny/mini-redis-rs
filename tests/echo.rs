@@ -1,20 +1,9 @@
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
-async fn spawn_server() -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        mini_redis_rs::server::run(listener, async move {
-            let _ = rx.await;
-        })
-        .await
-        .ok();
-    });
-    (addr, tx)
-}
+mod common;
+use common::spawn_server;
 
 #[tokio::test]
 async fn ping_pong() {

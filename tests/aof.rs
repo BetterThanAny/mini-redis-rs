@@ -3,9 +3,14 @@ use mini_redis_rs::db::Db;
 use mini_redis_rs::server;
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
+mod common;
+use common::{array, read_n, send};
+
+/// AOF-aware server spawner — distinct from `common::spawn_server` because it
+/// also wires up `aof::replay` + `aof::spawn_writer`.
 async fn spawn_with_aof(
     aof_path: std::path::PathBuf,
 ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
@@ -13,12 +18,14 @@ async fn spawn_with_aof(
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let db = Db::new();
-    let aof_handle = if aof_path.exists() {
+    if aof_path.exists() {
         let _ = aof::replay(&aof_path, &db).await.unwrap();
-        Some(aof::spawn_writer(aof_path.clone(), FsyncPolicy::Always).await.unwrap())
-    } else {
-        Some(aof::spawn_writer(aof_path.clone(), FsyncPolicy::Always).await.unwrap())
-    };
+    }
+    let aof_handle = Some(
+        aof::spawn_writer(aof_path.clone(), FsyncPolicy::Always)
+            .await
+            .unwrap(),
+    );
     tokio::spawn(async move {
         server::run_with_options(listener, db, aof_handle, async move {
             let _ = rx.await;
@@ -27,29 +34,6 @@ async fn spawn_with_aof(
         .ok();
     });
     (addr, tx)
-}
-
-async fn send(sock: &mut TcpStream, raw: &[u8]) {
-    sock.write_all(raw).await.unwrap();
-}
-
-async fn read_n(sock: &mut TcpStream, n: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; n];
-    tokio::time::timeout(Duration::from_secs(2), sock.read_exact(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    buf
-}
-
-fn array(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
-    for p in parts {
-        out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
-        out.extend_from_slice(p);
-        out.extend_from_slice(b"\r\n");
-    }
-    out
 }
 
 #[tokio::test]

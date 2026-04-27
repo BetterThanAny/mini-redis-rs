@@ -1,53 +1,8 @@
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
-async fn spawn_server() -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        mini_redis_rs::server::run(listener, async move {
-            let _ = rx.await;
-        })
-        .await
-        .ok();
-    });
-    (addr, tx)
-}
-
-async fn send(sock: &mut TcpStream, raw: &[u8]) {
-    sock.write_all(raw).await.unwrap();
-}
-
-async fn read_n(sock: &mut TcpStream, n: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; n];
-    tokio::time::timeout(Duration::from_secs(2), sock.read_exact(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    buf
-}
-
-async fn read_some(sock: &mut TcpStream) -> Vec<u8> {
-    let mut buf = vec![0u8; 512];
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    buf.truncate(n);
-    buf
-}
-
-fn array(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
-    for p in parts {
-        out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
-        out.extend_from_slice(p);
-        out.extend_from_slice(b"\r\n");
-    }
-    out
-}
+mod common;
+use common::{array, read_n, read_some, send, spawn_server};
 
 #[tokio::test]
 async fn subscribe_returns_ack() {
@@ -118,10 +73,13 @@ async fn subscribe_to_multiple_channels() {
     let (addr, _g) = spawn_server().await;
     let mut sub = TcpStream::connect(addr).await.unwrap();
     send(&mut sub, &array(&[b"SUBSCRIBE", b"a", b"b", b"c"])).await;
-    let resp = read_some(&mut sub).await;
-    // Should get 3 ack frames
-    let ack_count = resp.windows(b"$9\r\nsubscribe\r\n".len())
-        .filter(|w| *w == b"$9\r\nsubscribe\r\n").count();
+    // 3 acks @ 30 bytes each (single-char channel, single-digit count) = 90 bytes.
+    // Use read_n rather than read_some — read_some can return after the first frame.
+    let resp = read_n(&mut sub, 90).await;
+    let ack_count = resp
+        .windows(b"$9\r\nsubscribe\r\n".len())
+        .filter(|w| *w == b"$9\r\nsubscribe\r\n")
+        .count();
     assert_eq!(ack_count, 3, "got: {:?}", resp);
 }
 
@@ -130,15 +88,13 @@ async fn unsubscribe_specific_channel() {
     let (addr, _g) = spawn_server().await;
     let mut sub = TcpStream::connect(addr).await.unwrap();
     send(&mut sub, &array(&[b"SUBSCRIBE", b"a", b"b"])).await;
-    let _ = read_some(&mut sub).await;
+    // 2 subscribe acks @ 30 bytes = 60 bytes
+    let _ = read_n(&mut sub, 60).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     send(&mut sub, &array(&[b"UNSUBSCRIBE", b"a"])).await;
-    let resp = read_some(&mut sub).await;
-    // Should get one unsubscribe ack with count 1 (still subscribed to b)
-    assert!(resp.windows(b"$11\r\nunsubscribe\r\n".len())
-            .any(|w| w == b"$11\r\nunsubscribe\r\n"),
-            "got: {:?}", resp);
-    assert!(resp.ends_with(b":1\r\n"), "got: {:?}", resp);
+    // 1 unsubscribe ack: *3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:1\r\n = 33 bytes
+    let resp = read_n(&mut sub, 33).await;
+    assert_eq!(resp, b"*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:1\r\n");
 }
 
 #[tokio::test]
