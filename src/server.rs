@@ -29,11 +29,7 @@ pub async fn run_with_options(
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    db: Db,
-    aof: Option<AofHandle>,
-) -> anyhow::Result<()> {
+async fn accept_loop(listener: TcpListener, db: Db, aof: Option<AofHandle>) -> anyhow::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let db = db.clone();
@@ -70,7 +66,8 @@ async fn handle(
                 }
             }
             Err(e) => {
-                conn.write_frame(&Frame::Error(format!("ERR {}", e))).await?;
+                conn.write_frame(&Frame::Error(format!("ERR {}", e)))
+                    .await?;
             }
         }
     }

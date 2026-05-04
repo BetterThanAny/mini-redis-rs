@@ -155,7 +155,10 @@ pub fn hincrby(db: &Db, key: Bytes, field: Bytes, delta: i64) -> Frame {
         _ => return Frame::Error(WRONGTYPE.into()),
     };
     let current_v = map.entry(field).or_insert_with(|| Bytes::from_static(b"0"));
-    let current: i64 = match std::str::from_utf8(current_v).ok().and_then(|s| s.parse().ok()) {
+    let current: i64 = match std::str::from_utf8(current_v)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(n) => n,
         None => return Frame::Error(NOT_INT.into()),
     };

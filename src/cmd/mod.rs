@@ -12,7 +12,11 @@ pub enum Command {
     Ping(Option<Bytes>),
     Echo(Bytes),
     Get(Bytes),
-    Set { key: Bytes, value: Bytes, ex: Option<Duration> },
+    Set {
+        key: Bytes,
+        value: Bytes,
+        ex: Option<Duration>,
+    },
     Del(Vec<Bytes>),
     Exists(Vec<Bytes>),
     Incr(Bytes),
@@ -56,14 +60,45 @@ impl Command {
     pub fn is_write(&self) -> bool {
         use Command::*;
         match self {
-            Set { .. } | Del(_) | Incr(_) | Decr(_) | IncrBy(_, _) | DecrBy(_, _)
-            | Append(_, _) | MSet(_) | Expire(_, _) | PExpire(_, _) | Persist(_)
-            | LPush(_, _) | RPush(_, _) | LPop(_, _) | RPop(_, _)
-            | HSet(_, _) | HDel(_, _) | HIncrBy(_, _, _) => true,
-            Ping(_) | Echo(_) | Get(_) | Exists(_) | Strlen(_) | MGet(_)
-            | Ttl(_) | PTtl(_) | LRange(_, _, _) | LLen(_) | LIndex(_, _)
-            | HGet(_, _) | HKeys(_) | HVals(_) | HGetAll(_) | HExists(_, _) | HLen(_)
-            | Subscribe(_) | Unsubscribe(_) | Publish(_, _) | Unknown(_) => false,
+            Set { .. }
+            | Del(_)
+            | Incr(_)
+            | Decr(_)
+            | IncrBy(_, _)
+            | DecrBy(_, _)
+            | Append(_, _)
+            | MSet(_)
+            | Expire(_, _)
+            | PExpire(_, _)
+            | Persist(_)
+            | LPush(_, _)
+            | RPush(_, _)
+            | LPop(_, _)
+            | RPop(_, _)
+            | HSet(_, _)
+            | HDel(_, _)
+            | HIncrBy(_, _, _) => true,
+            Ping(_)
+            | Echo(_)
+            | Get(_)
+            | Exists(_)
+            | Strlen(_)
+            | MGet(_)
+            | Ttl(_)
+            | PTtl(_)
+            | LRange(_, _, _)
+            | LLen(_)
+            | LIndex(_, _)
+            | HGet(_, _)
+            | HKeys(_)
+            | HVals(_)
+            | HGetAll(_)
+            | HExists(_, _)
+            | HLen(_)
+            | Subscribe(_)
+            | Unsubscribe(_)
+            | Publish(_, _)
+            | Unknown(_) => false,
         }
     }
 }
@@ -168,8 +203,12 @@ impl Command {
                 }
                 Ok(Command::MSet(pairs))
             }
-            "EXPIRE" => parse_expire(rest, &name, /* ms */ false).map(|(k, d)| Command::Expire(k, d)),
-            "PEXPIRE" => parse_expire(rest, &name, /* ms */ true).map(|(k, d)| Command::PExpire(k, d)),
+            "EXPIRE" => {
+                parse_expire(rest, &name, /* ms */ false).map(|(k, d)| Command::Expire(k, d))
+            }
+            "PEXPIRE" => {
+                parse_expire(rest, &name, /* ms */ true).map(|(k, d)| Command::PExpire(k, d))
+            }
             "TTL" => one_arg(rest, &name).map(Command::Ttl),
             "PTTL" => one_arg(rest, &name).map(Command::PTtl),
             "PERSIST" => one_arg(rest, &name).map(Command::Persist),
@@ -364,11 +403,7 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
     Ok(Command::Set { key, value, ex })
 }
 
-fn parse_expire(
-    rest: Vec<Bytes>,
-    name: &str,
-    ms: bool,
-) -> Result<(Bytes, Duration), ParseError> {
+fn parse_expire(rest: Vec<Bytes>, name: &str, ms: bool) -> Result<(Bytes, Duration), ParseError> {
     if rest.len() != 2 {
         return Err(ParseError::Arity(name.to_string()));
     }

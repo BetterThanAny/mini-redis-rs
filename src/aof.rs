@@ -56,7 +56,10 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
         // (otherwise the server can never restart on a partially-trashed AOF).
         match parser::parse(&mut buf) {
             Ok(None) => {
-                tracing::warn!(remaining = buf.len(), "AOF truncated mid-frame; stopping replay");
+                tracing::warn!(
+                    remaining = buf.len(),
+                    "AOF truncated mid-frame; stopping replay"
+                );
                 break;
             }
             Ok(Some(frame)) => match Command::from_frame(frame) {
@@ -69,7 +72,11 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
                 }
             },
             Err(e) => {
-                tracing::warn!(?e, remaining = buf.len(), "AOF parse error; stopping replay");
+                tracing::warn!(
+                    ?e,
+                    remaining = buf.len(),
+                    "AOF parse error; stopping replay"
+                );
                 break;
             }
         }
@@ -90,11 +97,7 @@ pub async fn spawn_writer(path: PathBuf, policy: FsyncPolicy) -> anyhow::Result<
     Ok(AofHandle { sender: tx })
 }
 
-async fn run_writer(
-    mut file: File,
-    mut rx: mpsc::UnboundedReceiver<Bytes>,
-    policy: FsyncPolicy,
-) {
+async fn run_writer(mut file: File, mut rx: mpsc::UnboundedReceiver<Bytes>, policy: FsyncPolicy) {
     let mut last_sync = tokio::time::Instant::now();
     let sync_interval = std::time::Duration::from_secs(1);
 

@@ -94,7 +94,11 @@ async fn lindex_positive_and_negative() {
 async fn lrange_negative_indices() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
-    send(&mut s, &array(&[b"RPUSH", b"l", b"a", b"b", b"c", b"d", b"e"])).await;
+    send(
+        &mut s,
+        &array(&[b"RPUSH", b"l", b"a", b"b", b"c", b"d", b"e"]),
+    )
+    .await;
     let _ = read_n(&mut s, 4).await;
     send(&mut s, &array(&[b"LRANGE", b"l", b"-2", b"-1"])).await;
     let resp = read_some(&mut s).await;

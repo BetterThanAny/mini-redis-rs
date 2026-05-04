@@ -77,7 +77,10 @@ pub fn incr(db: &Db, key: Bytes, delta: i64) -> Frame {
         entry.expires_at = None;
     }
     let current = match &entry.value {
-        Value::String(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+        Value::String(b) => match std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             Some(n) => n,
             None => return Frame::Error(NOT_INT.into()),
         },
@@ -186,8 +189,8 @@ pub fn ttl(db: &Db, key: &Bytes, in_ms: bool) -> Frame {
                     } else {
                         // Round up partial seconds so e.g. 1.2s remaining returns 2,
                         // matching Redis semantics for fresh `EXPIRE k 30`.
-                        let secs = remaining.as_secs() as i64
-                            + i64::from(remaining.subsec_millis() > 0);
+                        let secs =
+                            remaining.as_secs() as i64 + i64::from(remaining.subsec_millis() > 0);
                         Frame::Integer(secs)
                     }
                 }

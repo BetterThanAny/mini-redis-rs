@@ -13,11 +13,7 @@ enum PushSide {
 fn push(db: &Db, key: Bytes, values: Vec<Bytes>, side: PushSide) -> Frame {
     let mut shard = db.shard_for(&key).lock().unwrap();
     // If existing entry is expired, treat as missing
-    let stale = shard
-        .entries
-        .get(&key)
-        .map(entry_expired)
-        .unwrap_or(false);
+    let stale = shard.entries.get(&key).map(entry_expired).unwrap_or(false);
     if stale {
         shard.entries.remove(&key);
     }

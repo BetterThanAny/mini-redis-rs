@@ -49,11 +49,7 @@ async fn hdel_counts_removals() {
 async fn hkeys_and_hvals() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
-    send(
-        &mut s,
-        &array(&[b"HSET", b"u", b"a", b"1", b"b", b"2"]),
-    )
-    .await;
+    send(&mut s, &array(&[b"HSET", b"u", b"a", b"1", b"b", b"2"])).await;
     let _ = read_n(&mut s, 4).await;
 
     send(&mut s, &array(&[b"HKEYS", b"u"])).await;
@@ -106,7 +102,11 @@ async fn hexists_works() {
 async fn hlen_works() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
-    send(&mut s, &array(&[b"HSET", b"u", b"a", b"1", b"b", b"2", b"c", b"3"])).await;
+    send(
+        &mut s,
+        &array(&[b"HSET", b"u", b"a", b"1", b"b", b"2", b"c", b"3"]),
+    )
+    .await;
     let _ = read_n(&mut s, 4).await;
     send(&mut s, &array(&[b"HLEN", b"u"])).await;
     assert_eq!(read_n(&mut s, 4).await, b":3\r\n");

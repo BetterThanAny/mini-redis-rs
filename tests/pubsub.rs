@@ -33,18 +33,11 @@ async fn subscriber_receives_published_message() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mut publisher = TcpStream::connect(addr).await.unwrap();
-    send(
-        &mut publisher,
-        &array(&[b"PUBLISH", b"news", b"hello"]),
-    )
-    .await;
+    send(&mut publisher, &array(&[b"PUBLISH", b"news", b"hello"])).await;
     assert_eq!(read_n(&mut publisher, 4).await, b":1\r\n");
 
     let msg = read_some(&mut sub).await;
-    assert_eq!(
-        msg,
-        b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n"
-    );
+    assert_eq!(msg, b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n");
 }
 
 #[tokio::test]
@@ -107,7 +100,11 @@ async fn ping_works_in_subscribed_mode() {
     let resp = read_some(&mut sub).await;
     // Subscribed PING returns *2\r\n$4\r\npong\r\n$0\r\n\r\n
     assert!(resp.starts_with(b"*2\r\n"), "got: {:?}", resp);
-    assert!(resp.windows(8).any(|w| w == b"$4\r\npong"), "got: {:?}", resp);
+    assert!(
+        resp.windows(8).any(|w| w == b"$4\r\npong"),
+        "got: {:?}",
+        resp
+    );
 }
 
 #[tokio::test]

@@ -78,11 +78,7 @@ async fn incrby_decrby() {
 async fn incr_overflow_errors() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
-    send(
-        &mut s,
-        &array(&[b"SET", b"x", b"9223372036854775806"]),
-    )
-    .await;
+    send(&mut s, &array(&[b"SET", b"x", b"9223372036854775806"])).await;
     let _ = read_n(&mut s, 5).await;
     send(&mut s, &array(&[b"INCRBY", b"x", b"100"])).await;
     let resp = read_some(&mut s).await;
@@ -117,7 +113,11 @@ async fn strlen_works() {
 async fn mset_mget() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
-    send(&mut s, &array(&[b"MSET", b"a", b"1", b"b", b"2", b"c", b"3"])).await;
+    send(
+        &mut s,
+        &array(&[b"MSET", b"a", b"1", b"b", b"2", b"c", b"3"]),
+    )
+    .await;
     assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
     send(&mut s, &array(&[b"MGET", b"a", b"missing", b"b"])).await;
     let resp = read_some(&mut s).await;
