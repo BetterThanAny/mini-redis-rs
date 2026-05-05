@@ -41,6 +41,25 @@ impl Shard {
             }
         }
     }
+
+    pub fn remove_entry(&mut self, key: &Bytes) -> Option<Entry> {
+        let entry = self.entries.remove(key)?;
+        if let Some(t) = entry.expires_at {
+            self.unindex_expiration(t, key);
+        }
+        Some(entry)
+    }
+
+    pub fn expire_if_stale(&mut self, key: &Bytes) -> bool {
+        let Some(deadline) = self.entries.get(key).and_then(|entry| entry.expires_at) else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.remove_entry(key);
+        true
+    }
 }
 
 #[derive(Clone)]

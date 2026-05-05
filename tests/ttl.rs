@@ -2,7 +2,25 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 
 mod common;
+use bytes::Bytes;
 use common::{array, read_n, read_some, send, spawn_server};
+use mini_redis_rs::cmd::string;
+use mini_redis_rs::db::Db;
+use mini_redis_rs::resp::Frame;
+
+fn key(s: &'static str) -> Bytes {
+    Bytes::from_static(s.as_bytes())
+}
+
+fn expiration_index_len(db: &Db, key: &Bytes) -> usize {
+    let shard = db.shard_for(key).lock().unwrap();
+    shard
+        .expirations
+        .values()
+        .flatten()
+        .filter(|indexed| *indexed == key)
+        .count()
+}
 
 #[tokio::test]
 async fn ttl_missing_returns_minus_two() {
@@ -159,4 +177,77 @@ async fn set_overrides_existing_ttl() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     send(&mut s, &array(&[b"GET", b"k"])).await;
     assert_eq!(read_n(&mut s, 8).await, b"$2\r\nv2\r\n");
+}
+
+#[tokio::test]
+async fn expired_unswept_key_is_missing_for_mutating_commands() {
+    let db = Db::new();
+    let ttl = Duration::from_millis(1);
+    let del_key = key("expired-del");
+    let append_key = key("expired-append");
+    let expire_key = key("expired-expire");
+    let persist_key = key("expired-persist");
+
+    for k in [&del_key, &append_key, &expire_key, &persist_key] {
+        assert_eq!(
+            string::set(&db, k.clone(), Bytes::from_static(b"old"), Some(ttl)),
+            Frame::Simple("OK".into())
+        );
+        assert_eq!(expiration_index_len(&db, k), 1);
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_eq!(string::del(&db, &[del_key.clone()]), Frame::Integer(0));
+    assert_eq!(string::get(&db, &del_key), Frame::Null);
+    assert_eq!(expiration_index_len(&db, &del_key), 0);
+
+    assert_eq!(
+        string::append(&db, append_key.clone(), Bytes::from_static(b"new")),
+        Frame::Integer(3)
+    );
+    assert_eq!(
+        string::get(&db, &append_key),
+        Frame::Bulk(Bytes::from_static(b"new"))
+    );
+    assert_eq!(expiration_index_len(&db, &append_key), 0);
+
+    assert_eq!(
+        string::expire(&db, expire_key.clone(), Duration::from_secs(30)),
+        Frame::Integer(0)
+    );
+    assert_eq!(string::get(&db, &expire_key), Frame::Null);
+    assert_eq!(expiration_index_len(&db, &expire_key), 0);
+
+    assert_eq!(string::persist(&db, &persist_key), Frame::Integer(0));
+    assert_eq!(string::get(&db, &persist_key), Frame::Null);
+    assert_eq!(expiration_index_len(&db, &persist_key), 0);
+}
+
+#[tokio::test]
+async fn mset_clears_existing_ttl_index() {
+    let db = Db::new();
+    let k = key("mset-clears-ttl");
+
+    assert_eq!(
+        string::set(
+            &db,
+            k.clone(),
+            Bytes::from_static(b"old"),
+            Some(Duration::from_secs(60))
+        ),
+        Frame::Simple("OK".into())
+    );
+    assert_eq!(expiration_index_len(&db, &k), 1);
+
+    assert_eq!(
+        string::mset(&db, vec![(k.clone(), Bytes::from_static(b"new"))]),
+        Frame::Simple("OK".into())
+    );
+
+    assert_eq!(string::ttl(&db, &k, false), Frame::Integer(-1));
+    assert_eq!(
+        string::get(&db, &k),
+        Frame::Bulk(Bytes::from_static(b"new"))
+    );
+    assert_eq!(expiration_index_len(&db, &k), 0);
 }

@@ -43,7 +43,10 @@ pub fn del(db: &Db, keys: &[Bytes]) -> Frame {
     let mut removed = 0i64;
     for key in keys {
         let mut shard = db.shard_for(key).lock().unwrap();
-        if shard.entries.remove(key).is_some() {
+        if shard.expire_if_stale(key) {
+            continue;
+        }
+        if shard.remove_entry(key).is_some() {
             removed += 1;
         }
     }
@@ -96,6 +99,7 @@ pub fn incr(db: &Db, key: Bytes, delta: i64) -> Frame {
 
 pub fn append(db: &Db, key: Bytes, suffix: Bytes) -> Frame {
     let mut shard = db.shard_for(&key).lock().unwrap();
+    shard.expire_if_stale(&key);
     let entry = shard.entries.entry(key).or_insert(Entry {
         value: Value::String(Bytes::new()),
         expires_at: None,
@@ -143,6 +147,9 @@ pub fn mget(db: &Db, keys: &[Bytes]) -> Frame {
 pub fn mset(db: &Db, pairs: Vec<(Bytes, Bytes)>) -> Frame {
     for (k, v) in pairs {
         let mut shard = db.shard_for(&k).lock().unwrap();
+        if let Some(old) = shard.entries.get(&k).and_then(|e| e.expires_at) {
+            shard.unindex_expiration(old, &k);
+        }
         shard.entries.insert(
             k,
             Entry {
@@ -159,6 +166,9 @@ pub fn mset(db: &Db, pairs: Vec<(Bytes, Bytes)>) -> Frame {
 pub fn expire(db: &Db, key: Bytes, ttl: Duration) -> Frame {
     let deadline = Instant::now() + ttl;
     let mut shard = db.shard_for(&key).lock().unwrap();
+    if shard.expire_if_stale(&key) {
+        return Frame::Integer(0);
+    }
     if !shard.entries.contains_key(&key) {
         return Frame::Integer(0);
     }
@@ -201,6 +211,9 @@ pub fn ttl(db: &Db, key: &Bytes, in_ms: bool) -> Frame {
 
 pub fn persist(db: &Db, key: &Bytes) -> Frame {
     let mut shard = db.shard_for(key).lock().unwrap();
+    if shard.expire_if_stale(key) {
+        return Frame::Integer(0);
+    }
     let old = match shard.entries.get_mut(key) {
         Some(entry) if entry.expires_at.is_some() => entry.expires_at.take().unwrap(),
         _ => return Frame::Integer(0),
