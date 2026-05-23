@@ -197,7 +197,10 @@ async fn expired_unswept_key_is_missing_for_mutating_commands() {
     }
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    assert_eq!(string::del(&db, &[del_key.clone()]), Frame::Integer(0));
+    assert_eq!(
+        string::del(&db, std::slice::from_ref(&del_key)),
+        Frame::Integer(0)
+    );
     assert_eq!(string::get(&db, &del_key), Frame::Null);
     assert_eq!(expiration_index_len(&db, &del_key), 0);
 

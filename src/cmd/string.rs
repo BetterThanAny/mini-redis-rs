@@ -1,7 +1,7 @@
-use crate::db::{entry_expired, Db, Entry, Value};
+use crate::db::{entry_expired, now_millis, Db, Entry, ExpireAt, Value};
 use crate::resp::Frame;
 use bytes::Bytes;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
 const NOT_INT: &str = "ERR value is not an integer or out of range";
@@ -19,7 +19,11 @@ pub fn get(db: &Db, key: &Bytes) -> Frame {
 }
 
 pub fn set(db: &Db, key: Bytes, value: Bytes, ex: Option<Duration>) -> Frame {
-    let expires_at = ex.map(|d| Instant::now() + d);
+    let expires_at = ex.map(|d| now_millis() + d.as_millis());
+    set_at(db, key, value, expires_at)
+}
+
+pub fn set_at(db: &Db, key: Bytes, value: Bytes, expires_at: Option<ExpireAt>) -> Frame {
     let mut shard = db.shard_for(&key).lock().unwrap();
     // If overwriting an entry that had a TTL, drop the stale BTreeMap row
     // so the index doesn't grow unboundedly under SET EX / EXPIRE churn.
@@ -164,13 +168,21 @@ pub fn mset(db: &Db, pairs: Vec<(Bytes, Bytes)>) -> Frame {
 // ---- expiration commands ----
 
 pub fn expire(db: &Db, key: Bytes, ttl: Duration) -> Frame {
-    let deadline = Instant::now() + ttl;
+    let deadline = now_millis() + ttl.as_millis();
+    expire_at(db, key, deadline)
+}
+
+pub fn expire_at(db: &Db, key: Bytes, deadline: ExpireAt) -> Frame {
     let mut shard = db.shard_for(&key).lock().unwrap();
     if shard.expire_if_stale(&key) {
         return Frame::Integer(0);
     }
     if !shard.entries.contains_key(&key) {
         return Frame::Integer(0);
+    }
+    if deadline <= now_millis() {
+        shard.remove_entry(&key);
+        return Frame::Integer(1);
     }
     if let Some(old) = shard.entries.get(&key).and_then(|e| e.expires_at) {
         shard.unindex_expiration(old, &key);
@@ -189,18 +201,18 @@ pub fn ttl(db: &Db, key: &Bytes, in_ms: bool) -> Frame {
         Some(entry) => match entry.expires_at {
             None => Frame::Integer(-1),
             Some(t) => {
-                let now = Instant::now();
+                let now = now_millis();
                 if t <= now {
                     Frame::Integer(-2)
                 } else {
-                    let remaining = t - now;
                     if in_ms {
-                        Frame::Integer(remaining.as_millis() as i64)
+                        Frame::Integer((t - now) as i64)
                     } else {
                         // Round up partial seconds so e.g. 1.2s remaining returns 2,
                         // matching Redis semantics for fresh `EXPIRE k 30`.
+                        let remaining_ms = t - now;
                         let secs =
-                            remaining.as_secs() as i64 + i64::from(remaining.subsec_millis() > 0);
+                            (remaining_ms / 1000) as i64 + i64::from(remaining_ms % 1000 > 0);
                         Frame::Integer(secs)
                     }
                 }

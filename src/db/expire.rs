@@ -1,6 +1,6 @@
 use crate::db::Db;
 use bytes::Bytes;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -13,7 +13,7 @@ pub async fn run_sweeper(db: Db) {
 }
 
 pub fn sweep_once(db: &Db) {
-    let now = Instant::now();
+    let now = crate::db::now_millis();
     for shard_mu in db.iter_shards() {
         let mut shard = shard_mu.lock().unwrap();
         let due_keys: Vec<Bytes> = shard

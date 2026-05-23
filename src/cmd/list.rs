@@ -15,7 +15,7 @@ fn push(db: &Db, key: Bytes, values: Vec<Bytes>, side: PushSide) -> Frame {
     // If existing entry is expired, treat as missing
     let stale = shard.entries.get(&key).map(entry_expired).unwrap_or(false);
     if stale {
-        shard.entries.remove(&key);
+        shard.remove_entry(&key);
     }
     let entry = shard.entries.entry(key).or_insert(Entry {
         value: Value::List(VecDeque::new()),
@@ -51,7 +51,7 @@ fn pop(db: &Db, key: &Bytes, count: Option<usize>, side: PopSide) -> Frame {
     let mut shard = db.shard_for(key).lock().unwrap();
     let stale = shard.entries.get(key).map(entry_expired).unwrap_or(false);
     if stale {
-        shard.entries.remove(key);
+        shard.remove_entry(key);
     }
     let entry = match shard.entries.get_mut(key) {
         Some(e) => e,

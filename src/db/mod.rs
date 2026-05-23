@@ -3,37 +3,46 @@ pub mod expire;
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use tokio::sync::broadcast;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::{broadcast, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use xxhash_rust::xxh64::xxh64;
 
 const SHARDS: usize = 16;
 const PUBSUB_CHAN_CAP: usize = 1024;
 
-#[derive(Debug)]
+pub type ExpireAt = u128;
+
+pub fn now_millis() -> ExpireAt {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[derive(Debug, Clone)]
 pub enum Value {
     String(Bytes),
     List(VecDeque<Bytes>),
     Hash(HashMap<Bytes, Bytes>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub value: Value,
-    pub expires_at: Option<Instant>,
+    pub expires_at: Option<ExpireAt>,
 }
 
 #[derive(Default, Debug)]
 pub struct Shard {
     pub entries: HashMap<Bytes, Entry>,
-    pub expirations: BTreeMap<Instant, Vec<Bytes>>,
+    pub expirations: BTreeMap<ExpireAt, Vec<Bytes>>,
 }
 
 impl Shard {
     /// Remove `key` from the expiration index at deadline `t`. No-op if missing.
     /// Call this *before* writing a new deadline (or in PERSIST) so the BTreeMap
     /// stays bounded even under repeated SET EX / EXPIRE / PERSIST churn.
-    pub fn unindex_expiration(&mut self, t: Instant, key: &Bytes) {
+    pub fn unindex_expiration(&mut self, t: ExpireAt, key: &Bytes) {
         if let Some(keys) = self.expirations.get_mut(&t) {
             keys.retain(|k| k != key);
             if keys.is_empty() {
@@ -54,7 +63,7 @@ impl Shard {
         let Some(deadline) = self.entries.get(key).and_then(|entry| entry.expires_at) else {
             return false;
         };
-        if Instant::now() < deadline {
+        if now_millis() < deadline {
             return false;
         }
         self.remove_entry(key);
@@ -66,6 +75,19 @@ impl Shard {
 pub struct Db {
     shards: Arc<Vec<Mutex<Shard>>>,
     pubsub: Arc<Mutex<HashMap<Bytes, broadcast::Sender<Bytes>>>>,
+    write_gate: Arc<RwLock<()>>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DbStats {
+    pub keys: usize,
+    pub expiring_keys: usize,
+    pub strings: usize,
+    pub lists: usize,
+    pub hashes: usize,
+    pub list_items: usize,
+    pub hash_fields: usize,
+    pub approx_bytes: usize,
 }
 
 impl Db {
@@ -77,6 +99,7 @@ impl Db {
         Self {
             shards: Arc::new(v),
             pubsub: Arc::new(Mutex::new(HashMap::new())),
+            write_gate: Arc::new(RwLock::new(())),
         }
     }
 
@@ -87,6 +110,113 @@ impl Db {
 
     pub fn iter_shards(&self) -> impl Iterator<Item = &Mutex<Shard>> {
         self.shards.iter()
+    }
+
+    pub async fn write_guard(&self) -> OwnedRwLockReadGuard<()> {
+        self.write_gate.clone().read_owned().await
+    }
+
+    pub async fn pause_writes(&self) -> OwnedRwLockWriteGuard<()> {
+        self.write_gate.clone().write_owned().await
+    }
+
+    pub fn stats(&self) -> DbStats {
+        let now = now_millis();
+        let mut stats = DbStats::default();
+        for shard_mu in self.iter_shards() {
+            let shard = shard_mu.lock().unwrap();
+            for (key, entry) in &shard.entries {
+                if entry.expires_at.is_some_and(|deadline| deadline <= now) {
+                    continue;
+                }
+                stats.keys += 1;
+                stats.approx_bytes += key.len();
+                if entry.expires_at.is_some() {
+                    stats.expiring_keys += 1;
+                }
+                match &entry.value {
+                    Value::String(value) => {
+                        stats.strings += 1;
+                        stats.approx_bytes += value.len();
+                    }
+                    Value::List(values) => {
+                        stats.lists += 1;
+                        stats.list_items += values.len();
+                        stats.approx_bytes += values.iter().map(Bytes::len).sum::<usize>();
+                    }
+                    Value::Hash(values) => {
+                        stats.hashes += 1;
+                        stats.hash_fields += values.len();
+                        stats.approx_bytes += values
+                            .iter()
+                            .map(|(field, value)| field.len() + value.len())
+                            .sum::<usize>();
+                    }
+                }
+            }
+        }
+        stats
+    }
+
+    pub fn aof_snapshot_frames(&self) -> Vec<crate::resp::Frame> {
+        let now = now_millis();
+        let mut entries: Vec<(Bytes, Entry)> = Vec::new();
+        for shard_mu in self.iter_shards() {
+            let shard = shard_mu.lock().unwrap();
+            entries.extend(
+                shard
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| !entry.expires_at.is_some_and(|deadline| deadline <= now))
+                    .map(|(key, entry)| (key.clone(), entry.clone())),
+            );
+        }
+        entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+
+        let mut frames = Vec::with_capacity(entries.len() * 2);
+        for (key, entry) in entries {
+            match entry.value {
+                Value::String(value) => {
+                    let mut parts = vec![
+                        bulk_static(b"SET"),
+                        crate::resp::Frame::Bulk(key.clone()),
+                        crate::resp::Frame::Bulk(value),
+                    ];
+                    if let Some(deadline) = entry.expires_at {
+                        parts.push(bulk_static(b"PXAT"));
+                        parts.push(bulk_string(deadline));
+                    }
+                    frames.push(crate::resp::Frame::Array(parts));
+                }
+                Value::List(values) if !values.is_empty() => {
+                    let mut parts = Vec::with_capacity(values.len() + 2);
+                    parts.push(bulk_static(b"RPUSH"));
+                    parts.push(crate::resp::Frame::Bulk(key.clone()));
+                    parts.extend(values.into_iter().map(crate::resp::Frame::Bulk));
+                    frames.push(crate::resp::Frame::Array(parts));
+                    if let Some(deadline) = entry.expires_at {
+                        frames.push(pexpireat_frame(key, deadline));
+                    }
+                }
+                Value::Hash(values) if !values.is_empty() => {
+                    let mut fields: Vec<_> = values.into_iter().collect();
+                    fields.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+                    let mut parts = Vec::with_capacity(fields.len() * 2 + 2);
+                    parts.push(bulk_static(b"HSET"));
+                    parts.push(crate::resp::Frame::Bulk(key.clone()));
+                    for (field, value) in fields {
+                        parts.push(crate::resp::Frame::Bulk(field));
+                        parts.push(crate::resp::Frame::Bulk(value));
+                    }
+                    frames.push(crate::resp::Frame::Array(parts));
+                    if let Some(deadline) = entry.expires_at {
+                        frames.push(pexpireat_frame(key, deadline));
+                    }
+                }
+                Value::List(_) | Value::Hash(_) => {}
+            }
+        }
+        frames
     }
 
     /// Subscribe to a channel; returns a fresh receiver. Creates the channel if missing.
@@ -137,5 +267,21 @@ impl Default for Db {
 }
 
 pub fn entry_expired(entry: &Entry) -> bool {
-    matches!(entry.expires_at, Some(t) if Instant::now() >= t)
+    matches!(entry.expires_at, Some(t) if now_millis() >= t)
+}
+
+fn bulk_static(bytes: &'static [u8]) -> crate::resp::Frame {
+    crate::resp::Frame::Bulk(Bytes::from_static(bytes))
+}
+
+fn bulk_string(value: impl ToString) -> crate::resp::Frame {
+    crate::resp::Frame::Bulk(Bytes::from(value.to_string()))
+}
+
+fn pexpireat_frame(key: Bytes, deadline: ExpireAt) -> crate::resp::Frame {
+    crate::resp::Frame::Array(vec![
+        bulk_static(b"PEXPIREAT"),
+        crate::resp::Frame::Bulk(key),
+        bulk_string(deadline),
+    ])
 }

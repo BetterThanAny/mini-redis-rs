@@ -2,7 +2,7 @@ pub mod hash;
 pub mod list;
 pub mod string;
 
-use crate::db::Db;
+use crate::db::{now_millis, Db, ExpireAt};
 use crate::resp::Frame;
 use bytes::Bytes;
 use std::time::Duration;
@@ -15,7 +15,7 @@ pub enum Command {
     Set {
         key: Bytes,
         value: Bytes,
-        ex: Option<Duration>,
+        expires_at: Option<ExpireAt>,
     },
     Del(Vec<Bytes>),
     Exists(Vec<Bytes>),
@@ -27,8 +27,9 @@ pub enum Command {
     Strlen(Bytes),
     MGet(Vec<Bytes>),
     MSet(Vec<(Bytes, Bytes)>),
-    Expire(Bytes, Duration),
-    PExpire(Bytes, Duration),
+    Expire(Bytes, ExpireAt),
+    PExpire(Bytes, ExpireAt),
+    PExpireAt(Bytes, ExpireAt),
     Ttl(Bytes),
     PTtl(Bytes),
     Persist(Bytes),
@@ -51,6 +52,8 @@ pub enum Command {
     Subscribe(Vec<Bytes>),
     Unsubscribe(Option<Vec<Bytes>>),
     Publish(Bytes, Bytes),
+    Info(Option<String>),
+    BgRewriteAof,
     Unknown(String),
 }
 
@@ -70,6 +73,7 @@ impl Command {
             | MSet(_)
             | Expire(_, _)
             | PExpire(_, _)
+            | PExpireAt(_, _)
             | Persist(_)
             | LPush(_, _)
             | RPush(_, _)
@@ -98,7 +102,122 @@ impl Command {
             | Subscribe(_)
             | Unsubscribe(_)
             | Publish(_, _)
+            | Info(_)
+            | BgRewriteAof
             | Unknown(_) => false,
+        }
+    }
+
+    pub fn aof_frame(&self) -> Option<Frame> {
+        use Command::*;
+        match self {
+            Set {
+                key,
+                value,
+                expires_at,
+            } => {
+                let mut parts = vec![
+                    bulk(b"SET"),
+                    Frame::Bulk(key.clone()),
+                    Frame::Bulk(value.clone()),
+                ];
+                if let Some(deadline) = expires_at {
+                    parts.push(bulk(b"PXAT"));
+                    parts.push(bulk_string(deadline));
+                }
+                Some(Frame::Array(parts))
+            }
+            Del(keys) => Some(command_with_keys(b"DEL", keys)),
+            Incr(key) => Some(command_one(b"INCR", key)),
+            Decr(key) => Some(command_one(b"DECR", key)),
+            IncrBy(key, n) => Some(Frame::Array(vec![
+                bulk(b"INCRBY"),
+                Frame::Bulk(key.clone()),
+                bulk_string(n),
+            ])),
+            DecrBy(key, n) => Some(Frame::Array(vec![
+                bulk(b"DECRBY"),
+                Frame::Bulk(key.clone()),
+                bulk_string(n),
+            ])),
+            Append(key, value) => Some(Frame::Array(vec![
+                bulk(b"APPEND"),
+                Frame::Bulk(key.clone()),
+                Frame::Bulk(value.clone()),
+            ])),
+            MSet(pairs) => {
+                let mut parts = Vec::with_capacity(pairs.len() * 2 + 1);
+                parts.push(bulk(b"MSET"));
+                for (key, value) in pairs {
+                    parts.push(Frame::Bulk(key.clone()));
+                    parts.push(Frame::Bulk(value.clone()));
+                }
+                Some(Frame::Array(parts))
+            }
+            Expire(key, deadline) | PExpire(key, deadline) | PExpireAt(key, deadline) => {
+                Some(pexpireat_frame(key, *deadline))
+            }
+            Persist(key) => Some(command_one(b"PERSIST", key)),
+            LPush(key, values) => Some(command_with_values(b"LPUSH", key, values)),
+            RPush(key, values) => Some(command_with_values(b"RPUSH", key, values)),
+            LPop(key, None) => Some(command_one(b"LPOP", key)),
+            LPop(key, Some(count)) => Some(Frame::Array(vec![
+                bulk(b"LPOP"),
+                Frame::Bulk(key.clone()),
+                bulk_string(count),
+            ])),
+            RPop(key, None) => Some(command_one(b"RPOP", key)),
+            RPop(key, Some(count)) => Some(Frame::Array(vec![
+                bulk(b"RPOP"),
+                Frame::Bulk(key.clone()),
+                bulk_string(count),
+            ])),
+            HSet(key, pairs) => {
+                let mut parts = Vec::with_capacity(pairs.len() * 2 + 2);
+                parts.push(bulk(b"HSET"));
+                parts.push(Frame::Bulk(key.clone()));
+                for (field, value) in pairs {
+                    parts.push(Frame::Bulk(field.clone()));
+                    parts.push(Frame::Bulk(value.clone()));
+                }
+                Some(Frame::Array(parts))
+            }
+            HDel(key, fields) => {
+                let mut parts = Vec::with_capacity(fields.len() + 2);
+                parts.push(bulk(b"HDEL"));
+                parts.push(Frame::Bulk(key.clone()));
+                parts.extend(fields.iter().cloned().map(Frame::Bulk));
+                Some(Frame::Array(parts))
+            }
+            HIncrBy(key, field, n) => Some(Frame::Array(vec![
+                bulk(b"HINCRBY"),
+                Frame::Bulk(key.clone()),
+                Frame::Bulk(field.clone()),
+                bulk_string(n),
+            ])),
+            Ping(_)
+            | Echo(_)
+            | Get(_)
+            | Exists(_)
+            | Strlen(_)
+            | MGet(_)
+            | Ttl(_)
+            | PTtl(_)
+            | LRange(_, _, _)
+            | LLen(_)
+            | LIndex(_, _)
+            | HGet(_, _)
+            | HKeys(_)
+            | HVals(_)
+            | HGetAll(_)
+            | HExists(_, _)
+            | HLen(_)
+            | Subscribe(_)
+            | Unsubscribe(_)
+            | Publish(_, _)
+            | Info(_)
+            | BgRewriteAof
+            | Unknown(_) => None,
         }
     }
 }
@@ -209,6 +328,12 @@ impl Command {
             "PEXPIRE" => {
                 parse_expire(rest, &name, /* ms */ true).map(|(k, d)| Command::PExpire(k, d))
             }
+            "EXPIREAT" => {
+                parse_expire_at(rest, &name, /* ms */ false).map(|(k, d)| Command::PExpireAt(k, d))
+            }
+            "PEXPIREAT" => {
+                parse_expire_at(rest, &name, /* ms */ true).map(|(k, d)| Command::PExpireAt(k, d))
+            }
             "TTL" => one_arg(rest, &name).map(Command::Ttl),
             "PTTL" => one_arg(rest, &name).map(Command::PTtl),
             "PERSIST" => one_arg(rest, &name).map(Command::Persist),
@@ -305,6 +430,23 @@ impl Command {
                 let mut it = rest.into_iter();
                 Ok(Command::Publish(it.next().unwrap(), it.next().unwrap()))
             }
+            "INFO" => match rest.len() {
+                0 => Ok(Command::Info(None)),
+                1 => {
+                    let section = std::str::from_utf8(&rest[0])
+                        .map_err(|_| ParseError::Syntax)?
+                        .to_ascii_lowercase();
+                    Ok(Command::Info(Some(section)))
+                }
+                _ => Err(arity_err()),
+            },
+            "BGREWRITEAOF" => {
+                if rest.is_empty() {
+                    Ok(Command::BgRewriteAof)
+                } else {
+                    Err(arity_err())
+                }
+            }
             other => Ok(Command::Unknown(other.to_string())),
         }
     }
@@ -315,7 +457,11 @@ impl Command {
             Command::Ping(Some(msg)) => Frame::Bulk(msg),
             Command::Echo(msg) => Frame::Bulk(msg),
             Command::Get(k) => string::get(db, &k),
-            Command::Set { key, value, ex } => string::set(db, key, value, ex),
+            Command::Set {
+                key,
+                value,
+                expires_at,
+            } => string::set_at(db, key, value, expires_at),
             Command::Del(keys) => string::del(db, &keys),
             Command::Exists(keys) => string::exists(db, &keys),
             Command::Incr(k) => string::incr(db, k, 1),
@@ -329,8 +475,9 @@ impl Command {
             Command::Strlen(k) => string::strlen(db, &k),
             Command::MGet(keys) => string::mget(db, &keys),
             Command::MSet(pairs) => string::mset(db, pairs),
-            Command::Expire(k, d) => string::expire(db, k, d),
-            Command::PExpire(k, d) => string::expire(db, k, d),
+            Command::Expire(k, d) | Command::PExpire(k, d) | Command::PExpireAt(k, d) => {
+                string::expire_at(db, k, d)
+            }
             Command::Ttl(k) => string::ttl(db, &k, false),
             Command::PTtl(k) => string::ttl(db, &k, true),
             Command::Persist(k) => string::persist(db, &k),
@@ -351,6 +498,8 @@ impl Command {
             Command::HLen(k) => hash::hlen(db, &k),
             Command::HIncrBy(k, f, n) => hash::hincrby(db, k, f, n),
             Command::Publish(ch, msg) => Frame::Integer(db.pubsub_publish(&ch, msg) as i64),
+            Command::Info(section) => crate::server::info_frame(db, None, None, section.as_deref()),
+            Command::BgRewriteAof => Frame::Error("ERR AOF is not enabled".into()),
             // SUBSCRIBE / UNSUBSCRIBE are handled by the connection task itself,
             // not via this synchronous apply() path.
             Command::Subscribe(_) | Command::Unsubscribe(_) => {
@@ -375,7 +524,7 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
     let mut it = rest.into_iter();
     let key = it.next().unwrap();
     let value = it.next().unwrap();
-    let mut ex: Option<Duration> = None;
+    let mut expires_at: Option<ExpireAt> = None;
     while let Some(opt) = it.next() {
         let opt_upper = std::str::from_utf8(&opt)
             .map_err(|_| ParseError::Syntax)?
@@ -387,7 +536,7 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 if n <= 0 {
                     return Err(ParseError::Syntax);
                 }
-                ex = Some(Duration::from_secs(n as u64));
+                expires_at = Some(now_millis() + Duration::from_secs(n as u64).as_millis());
             }
             "PX" => {
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
@@ -395,15 +544,28 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 if n <= 0 {
                     return Err(ParseError::Syntax);
                 }
-                ex = Some(Duration::from_millis(n as u64));
+                expires_at = Some(now_millis() + n as ExpireAt);
+            }
+            "EXAT" => {
+                let n_bytes = it.next().ok_or(ParseError::Syntax)?;
+                let n = parse_u128(&n_bytes)?;
+                expires_at = Some(n.saturating_mul(1000));
+            }
+            "PXAT" => {
+                let n_bytes = it.next().ok_or(ParseError::Syntax)?;
+                expires_at = Some(parse_u128(&n_bytes)?);
             }
             _ => return Err(ParseError::Syntax),
         }
     }
-    Ok(Command::Set { key, value, ex })
+    Ok(Command::Set {
+        key,
+        value,
+        expires_at,
+    })
 }
 
-fn parse_expire(rest: Vec<Bytes>, name: &str, ms: bool) -> Result<(Bytes, Duration), ParseError> {
+fn parse_expire(rest: Vec<Bytes>, name: &str, ms: bool) -> Result<(Bytes, ExpireAt), ParseError> {
     if rest.len() != 2 {
         return Err(ParseError::Arity(name.to_string()));
     }
@@ -413,12 +575,27 @@ fn parse_expire(rest: Vec<Bytes>, name: &str, ms: bool) -> Result<(Bytes, Durati
     if n < 0 {
         return Err(ParseError::Syntax);
     }
-    let dur = if ms {
-        Duration::from_millis(n as u64)
+    let deadline = if ms {
+        now_millis() + n as ExpireAt
     } else {
-        Duration::from_secs(n as u64)
+        now_millis() + Duration::from_secs(n as u64).as_millis()
     };
-    Ok((key, dur))
+    Ok((key, deadline))
+}
+
+fn parse_expire_at(
+    rest: Vec<Bytes>,
+    name: &str,
+    ms: bool,
+) -> Result<(Bytes, ExpireAt), ParseError> {
+    if rest.len() != 2 {
+        return Err(ParseError::Arity(name.to_string()));
+    }
+    let mut it = rest.into_iter();
+    let key = it.next().unwrap();
+    let n = parse_u128(&it.next().unwrap())?;
+    let deadline = if ms { n } else { n.saturating_mul(1000) };
+    Ok((key, deadline))
 }
 
 fn parse_push(rest: Vec<Bytes>, name: &str) -> Result<(Bytes, Vec<Bytes>), ParseError> {
@@ -450,6 +627,41 @@ fn parse_pop(rest: Vec<Bytes>, name: &str) -> Result<(Bytes, Option<usize>), Par
     }
 }
 
+fn bulk(bytes: &'static [u8]) -> Frame {
+    Frame::Bulk(Bytes::from_static(bytes))
+}
+
+fn bulk_string(value: impl ToString) -> Frame {
+    Frame::Bulk(Bytes::from(value.to_string()))
+}
+
+fn command_one(name: &'static [u8], key: &Bytes) -> Frame {
+    Frame::Array(vec![bulk(name), Frame::Bulk(key.clone())])
+}
+
+fn command_with_keys(name: &'static [u8], keys: &[Bytes]) -> Frame {
+    let mut parts = Vec::with_capacity(keys.len() + 1);
+    parts.push(bulk(name));
+    parts.extend(keys.iter().cloned().map(Frame::Bulk));
+    Frame::Array(parts)
+}
+
+fn command_with_values(name: &'static [u8], key: &Bytes, values: &[Bytes]) -> Frame {
+    let mut parts = Vec::with_capacity(values.len() + 2);
+    parts.push(bulk(name));
+    parts.push(Frame::Bulk(key.clone()));
+    parts.extend(values.iter().cloned().map(Frame::Bulk));
+    Frame::Array(parts)
+}
+
+fn pexpireat_frame(key: &Bytes, deadline: ExpireAt) -> Frame {
+    Frame::Array(vec![
+        bulk(b"PEXPIREAT"),
+        Frame::Bulk(key.clone()),
+        bulk_string(deadline),
+    ])
+}
+
 fn one_arg(rest: Vec<Bytes>, name: &str) -> Result<Bytes, ParseError> {
     if rest.len() != 1 {
         Err(ParseError::Arity(name.to_string()))
@@ -459,6 +671,13 @@ fn one_arg(rest: Vec<Bytes>, name: &str) -> Result<Bytes, ParseError> {
 }
 
 fn parse_i64(b: &[u8]) -> Result<i64, ParseError> {
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(ParseError::NotInt)
+}
+
+fn parse_u128(b: &[u8]) -> Result<u128, ParseError> {
     std::str::from_utf8(b)
         .ok()
         .and_then(|s| s.parse().ok())

@@ -11,7 +11,7 @@ pub fn hset(db: &Db, key: Bytes, pairs: Vec<(Bytes, Bytes)>) -> Frame {
     let mut shard = db.shard_for(&key).lock().unwrap();
     let stale = shard.entries.get(&key).map(entry_expired).unwrap_or(false);
     if stale {
-        shard.entries.remove(&key);
+        shard.remove_entry(&key);
     }
     let entry = shard.entries.entry(key).or_insert(Entry {
         value: Value::Hash(HashMap::new()),
@@ -50,7 +50,7 @@ pub fn hdel(db: &Db, key: &Bytes, fields: &[Bytes]) -> Frame {
     let mut shard = db.shard_for(key).lock().unwrap();
     let stale = shard.entries.get(key).map(entry_expired).unwrap_or(false);
     if stale {
-        shard.entries.remove(key);
+        shard.remove_entry(key);
     }
     let entry = match shard.entries.get_mut(key) {
         Some(e) => e,
@@ -144,7 +144,7 @@ pub fn hincrby(db: &Db, key: Bytes, field: Bytes, delta: i64) -> Frame {
     let mut shard = db.shard_for(&key).lock().unwrap();
     let stale = shard.entries.get(&key).map(entry_expired).unwrap_or(false);
     if stale {
-        shard.entries.remove(&key);
+        shard.remove_entry(&key);
     }
     let entry = shard.entries.entry(key).or_insert(Entry {
         value: Value::Hash(HashMap::new()),
