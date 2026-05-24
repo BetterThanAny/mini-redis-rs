@@ -10,6 +10,17 @@ streaming protocol parsing, command dispatch, sharded concurrent state,
 expiration, pub/sub fan-out, append-only persistence, crash recovery policy, and
 benchmarking against official Redis.
 
+## 30-Second Summary
+
+| Signal | Details |
+| --- | --- |
+| Positioning | Redis-compatible cache server from scratch, focused on protocol correctness, concurrency, TTL, AOF, and operational behavior. |
+| Stack | Rust, Tokio, RESP2, sharded `Arc<Mutex<_>>` state, broadcast pub/sub, append-only file persistence, GitHub Actions CI. |
+| Hard parts | Streaming parser, Redis-like command semantics, active + lazy expiration, crash-tolerant AOF replay, `BGREWRITEAOF` compaction while serving writes. |
+| Quick start | `cargo run --release -- --port 6380`; validate with `redis-cli -p 6380 SET hello world` and `GET hello`. |
+| Validation | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, plus `redis-cli` compatibility smoke tests. |
+| Benchmark / result | [BENCHMARK.md](BENCHMARK.md) compares local throughput with official Redis using `redis-benchmark`. |
+
 ## Quick Start
 
 ```bash
