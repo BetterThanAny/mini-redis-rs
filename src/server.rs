@@ -87,6 +87,7 @@ async fn handle(
                 run_subscribed(&mut conn, &db, channels).await?;
             }
             Ok(Command::Info(section)) => {
+                let _read_guard = db.write_guard().await;
                 let resp = info_frame(&db, aof.as_ref(), Some(&state), section.as_deref());
                 conn.write_frame(&resp).await?;
             }
@@ -108,11 +109,19 @@ async fn handle(
                 let is_write = cmd.is_write();
                 let aof_frame = if is_write { cmd.aof_frame() } else { None };
                 let resp = if is_write {
-                    let _write_guard = db.write_guard().await;
+                    let _write_guard = db.pause_writes().await;
+                    let rollback = if aof.is_some() {
+                        Some(db.snapshot_entries(&cmd.mutated_keys()))
+                    } else {
+                        None
+                    };
                     let resp = cmd.apply(&db);
                     if !matches!(resp, Frame::Error(_)) {
                         if let (Some(a), Some(frame)) = (&aof, &aof_frame) {
                             if let Err(e) = a.write(frame).await {
+                                if let Some(snapshot) = rollback {
+                                    db.restore_entries(snapshot);
+                                }
                                 Frame::Error(format!("ERR AOF write failed: {e}"))
                             } else {
                                 resp
@@ -124,6 +133,7 @@ async fn handle(
                         resp
                     }
                 } else {
+                    let _read_guard = db.write_guard().await;
                     cmd.apply(&db)
                 };
                 conn.write_frame(&resp).await?;
@@ -232,6 +242,10 @@ pub(crate) fn info_frame(
                     "aof_last_rewrite_time_ms:{}\r\n",
                     stats.last_rewrite_finished_ms
                 ));
+                out.push_str(&format!(
+                    "aof_write_failed:{}\r\n",
+                    usize::from(stats.write_failed)
+                ));
                 if let Some(err) = stats.last_error {
                     out.push_str(&format!("aof_last_error:{}\r\n", sanitize_info_value(&err)));
                 }
@@ -268,10 +282,11 @@ async fn run_subscribed(
     initial_channels: Vec<Bytes>,
 ) -> anyhow::Result<()> {
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Bytes, Bytes)>(PUBSUB_OUTPUT_CAP);
+    let (slow_tx, mut slow_rx) = mpsc::unbounded_channel::<Bytes>();
     let mut tasks: HashMap<Bytes, tokio::task::JoinHandle<()>> = HashMap::new();
 
     for ch in initial_channels {
-        subscribe_one(&mut tasks, &msg_tx, db, ch.clone());
+        subscribe_one(&mut tasks, &msg_tx, &slow_tx, db, ch.clone());
         ack_subscribe(conn, b"subscribe", &ch, tasks.len()).await?;
     }
 
@@ -285,7 +300,7 @@ async fn run_subscribed(
                 match Command::from_frame(frame) {
                     Ok(Command::Subscribe(chs)) => {
                         for ch in chs {
-                            subscribe_one(&mut tasks, &msg_tx, db, ch.clone());
+                            subscribe_one(&mut tasks, &msg_tx, &slow_tx, db, ch.clone());
                             ack_subscribe(conn, b"subscribe", &ch, tasks.len()).await?;
                         }
                     }
@@ -336,6 +351,14 @@ async fn run_subscribed(
                     Frame::Bulk(message),
                 ])).await?;
             }
+            slow = slow_rx.recv() => {
+                let Some(channel) = slow else { break; };
+                tracing::warn!(?channel, "closing slow pub/sub subscriber");
+                conn.write_frame(&Frame::Error(
+                    "ERR subscriber output buffer limit exceeded".into(),
+                )).await?;
+                break;
+            }
         }
     }
 
@@ -350,6 +373,7 @@ async fn run_subscribed(
 fn subscribe_one(
     tasks: &mut HashMap<Bytes, tokio::task::JoinHandle<()>>,
     msg_tx: &mpsc::Sender<(Bytes, Bytes)>,
+    slow_tx: &mpsc::UnboundedSender<Bytes>,
     db: &Db,
     channel: Bytes,
 ) {
@@ -358,16 +382,23 @@ fn subscribe_one(
     }
     let mut rx = db.pubsub_subscribe(channel.clone());
     let tx = msg_tx.clone();
+    let slow = slow_tx.clone();
     let ch_for_task = channel.clone();
     let h = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(msg) => {
-                    if tx.send((ch_for_task.clone(), msg)).await.is_err() {
+                Ok(msg) => match tx.try_send((ch_for_task.clone(), msg)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        let _ = slow.send(ch_for_task.clone());
                         return;
                     }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = slow.send(ch_for_task.clone());
+                    return;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }

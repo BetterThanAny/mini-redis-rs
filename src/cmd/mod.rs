@@ -220,6 +220,54 @@ impl Command {
             | Unknown(_) => None,
         }
     }
+
+    pub fn mutated_keys(&self) -> Vec<Bytes> {
+        use Command::*;
+        match self {
+            Set { key, .. }
+            | Incr(key)
+            | Decr(key)
+            | IncrBy(key, _)
+            | DecrBy(key, _)
+            | Append(key, _)
+            | Expire(key, _)
+            | PExpire(key, _)
+            | PExpireAt(key, _)
+            | Persist(key)
+            | LPush(key, _)
+            | RPush(key, _)
+            | LPop(key, _)
+            | RPop(key, _)
+            | HSet(key, _)
+            | HDel(key, _)
+            | HIncrBy(key, _, _) => vec![key.clone()],
+            Del(keys) => keys.clone(),
+            MSet(pairs) => pairs.iter().map(|(key, _)| key.clone()).collect(),
+            Ping(_)
+            | Echo(_)
+            | Get(_)
+            | Exists(_)
+            | Strlen(_)
+            | MGet(_)
+            | Ttl(_)
+            | PTtl(_)
+            | LRange(_, _, _)
+            | LLen(_)
+            | LIndex(_, _)
+            | HGet(_, _)
+            | HKeys(_)
+            | HVals(_)
+            | HGetAll(_)
+            | HExists(_, _)
+            | HLen(_)
+            | Subscribe(_)
+            | Unsubscribe(_)
+            | Publish(_, _)
+            | Info(_)
+            | BgRewriteAof
+            | Unknown(_) => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

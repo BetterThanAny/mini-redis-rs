@@ -116,13 +116,15 @@ Unsupported Redis commands return `ERR unknown command`.
 - One `tokio::spawn` per accepted connection.
 - Sharded shared state: `Arc<Vec<Mutex<Shard>>>` with 16 shards, key-hashed via
   `xxhash-rust`.
-- A lightweight DB write gate pauses mutating commands only while AOF rewrite
-  takes its snapshot.
+- A lightweight DB gate serializes mutating commands, lets read commands share
+  the read side, and pauses commands while AOF rewrite takes its snapshot.
 - Streaming RESP2 parser over `BytesMut`, with caps for bulk length, array
-  length, nesting depth, and unterminated line length.
+  length, nesting depth, unterminated line length, and per-connection buffered
+  frame bytes.
 - Active TTL sweeper using a per-shard `BTreeMap<absolute_ms, Vec<Bytes>>`.
 - Pub/Sub fan-out through `tokio::sync::broadcast`.
-- AOF uses a single writer task plus rewrite buffering and atomic replacement.
+- AOF uses a single writer task plus bounded rewrite buffering and atomic
+  replacement.
 
 ## Tests And CI
 
@@ -132,7 +134,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The integration suite currently has 103 tests covering RESP2 parsing, strings,
+The integration suite currently has 105 tests covering RESP2 parsing, strings,
 lists, hashes, pub/sub, TTL, AOF replay, AOF rewrite, `INFO`, and wire-level
 response shapes for `redis-cli` workflows. GitHub Actions runs fmt, clippy, and
 tests on push and pull request.

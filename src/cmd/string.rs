@@ -75,14 +75,11 @@ pub fn exists(db: &Db, keys: &[Bytes]) -> Frame {
 
 pub fn incr(db: &Db, key: Bytes, delta: i64) -> Frame {
     let mut shard = db.shard_for(&key).lock().unwrap();
+    shard.expire_if_stale(&key);
     let entry = shard.entries.entry(key).or_insert(Entry {
         value: Value::String(Bytes::from_static(b"0")),
         expires_at: None,
     });
-    if entry_expired(entry) {
-        entry.value = Value::String(Bytes::from_static(b"0"));
-        entry.expires_at = None;
-    }
     let current = match &entry.value {
         Value::String(b) => match std::str::from_utf8(b)
             .ok()

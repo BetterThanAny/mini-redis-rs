@@ -68,7 +68,7 @@ pub fn hdel(db: &Db, key: &Bytes, fields: &[Bytes]) -> Frame {
     }
     let now_empty = map.is_empty();
     if now_empty {
-        shard.entries.remove(key);
+        shard.remove_entry(key);
     }
     Frame::Integer(removed)
 }

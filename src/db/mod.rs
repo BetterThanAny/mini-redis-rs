@@ -158,6 +158,37 @@ impl Db {
         stats
     }
 
+    pub fn snapshot_entries(&self, keys: &[Bytes]) -> Vec<(Bytes, Option<Entry>)> {
+        let mut keys: Vec<Bytes> = keys.to_vec();
+        keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        keys.dedup();
+
+        keys.into_iter()
+            .map(|key| {
+                let shard = self.shard_for(&key).lock().unwrap();
+                let entry = shard.entries.get(&key).cloned();
+                (key, entry)
+            })
+            .collect()
+    }
+
+    pub fn restore_entries(&self, snapshots: Vec<(Bytes, Option<Entry>)>) {
+        for (key, snapshot) in snapshots {
+            let mut shard = self.shard_for(&key).lock().unwrap();
+            shard.remove_entry(&key);
+            if let Some(entry) = snapshot {
+                if let Some(deadline) = entry.expires_at {
+                    shard
+                        .expirations
+                        .entry(deadline)
+                        .or_default()
+                        .push(key.clone());
+                }
+                shard.entries.insert(key, entry);
+            }
+        }
+    }
+
     pub fn aof_snapshot_frames(&self) -> Vec<crate::resp::Frame> {
         let now = now_millis();
         let mut entries: Vec<(Bytes, Entry)> = Vec::new();

@@ -87,7 +87,7 @@ fn pop(db: &Db, key: &Bytes, count: Option<usize>, side: PopSide) -> Frame {
     }
     let list_now_empty = list.is_empty();
     if list_now_empty {
-        shard.entries.remove(key);
+        shard.remove_entry(key);
     }
     match count {
         None => Frame::Bulk(popped.into_iter().next().unwrap()),

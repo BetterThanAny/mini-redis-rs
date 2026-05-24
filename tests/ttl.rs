@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 mod common;
 use bytes::Bytes;
 use common::{array, read_n, read_some, send, spawn_server};
-use mini_redis_rs::cmd::string;
+use mini_redis_rs::cmd::{hash, list, string};
 use mini_redis_rs::db::{now_millis, Db};
 use mini_redis_rs::resp::Frame;
 
@@ -304,4 +304,56 @@ async fn mset_clears_existing_ttl_index() {
         Frame::Bulk(Bytes::from_static(b"new"))
     );
     assert_eq!(expiration_index_len(&db, &k), 0);
+}
+
+#[tokio::test]
+async fn mutating_expired_key_paths_clear_ttl_index() {
+    let db = Db::new();
+    let ttl = Duration::from_millis(1);
+    let incr_key = key("expired-incr-index");
+    let list_key = key("expired-list-index");
+    let hash_key = key("expired-hash-index");
+
+    assert_eq!(
+        string::set(&db, incr_key.clone(), Bytes::from_static(b"41"), Some(ttl)),
+        Frame::Simple("OK".into())
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert_eq!(string::incr(&db, incr_key.clone(), 1), Frame::Integer(1));
+    assert_eq!(expiration_index_len(&db, &incr_key), 0);
+
+    assert_eq!(
+        list::lpush(&db, list_key.clone(), vec![Bytes::from_static(b"x")]),
+        Frame::Integer(1)
+    );
+    assert_eq!(
+        string::expire(&db, list_key.clone(), Duration::from_secs(60)),
+        Frame::Integer(1)
+    );
+    assert_eq!(expiration_index_len(&db, &list_key), 1);
+    assert_eq!(
+        list::lpop(&db, &list_key, None),
+        Frame::Bulk(Bytes::from_static(b"x"))
+    );
+    assert_eq!(expiration_index_len(&db, &list_key), 0);
+
+    assert_eq!(
+        hash::hset(
+            &db,
+            hash_key.clone(),
+            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))]
+        ),
+        Frame::Integer(1)
+    );
+    assert_eq!(
+        string::expire(&db, hash_key.clone(), Duration::from_secs(60)),
+        Frame::Integer(1)
+    );
+    assert_eq!(expiration_index_len(&db, &hash_key), 1);
+    assert_eq!(
+        hash::hdel(&db, &hash_key, &[Bytes::from_static(b"f")]),
+        Frame::Integer(1)
+    );
+    assert_eq!(expiration_index_len(&db, &hash_key), 0);
 }

@@ -1,5 +1,5 @@
 use crate::cmd::Command;
-use crate::db::Db;
+use crate::db::{Db, Entry, ExpireAt, Value};
 use crate::resp::{encoder, parser, Frame};
 use bytes::{Bytes, BytesMut};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,8 @@ use std::sync::{
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+
+const MAX_REWRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
@@ -47,6 +49,7 @@ struct AofStatsInner {
     rewrite_count: AtomicU64,
     last_rewrite_ok: AtomicBool,
     last_rewrite_finished_ms: AtomicU64,
+    write_failed: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
 
@@ -60,6 +63,7 @@ pub struct AofStats {
     pub rewrite_count: u64,
     pub last_rewrite_status: &'static str,
     pub last_rewrite_finished_ms: u64,
+    pub write_failed: bool,
     pub last_error: Option<String>,
 }
 
@@ -81,6 +85,33 @@ enum AofMessage {
     },
 }
 
+struct RewriteBuffer {
+    frames: Vec<Bytes>,
+    bytes: usize,
+}
+
+impl RewriteBuffer {
+    fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: Bytes) -> anyhow::Result<()> {
+        let new_size = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite buffer size overflow"))?;
+        if new_size > MAX_REWRITE_BUFFER_BYTES {
+            anyhow::bail!("AOF rewrite buffer exceeded limit of {MAX_REWRITE_BUFFER_BYTES} bytes");
+        }
+        self.bytes = new_size;
+        self.frames.push(bytes);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct AofHandle {
     path: PathBuf,
@@ -91,6 +122,9 @@ pub struct AofHandle {
 
 impl AofHandle {
     pub async fn write(&self, frame: &Frame) -> anyhow::Result<()> {
+        if self.stats.write_failed.load(Ordering::SeqCst) {
+            anyhow::bail!("AOF writer is in failed state");
+        }
         let mut buf = BytesMut::new();
         encoder::encode(frame, &mut buf);
         let (tx, rx) = oneshot::channel();
@@ -163,6 +197,7 @@ impl AofHandle {
             rewrite_count,
             last_rewrite_status,
             last_rewrite_finished_ms: self.stats.last_rewrite_finished_ms.load(Ordering::SeqCst),
+            write_failed: self.stats.write_failed.load(Ordering::SeqCst),
             last_error,
         }
     }
@@ -177,6 +212,11 @@ impl AofHandle {
         self.stats
             .rewrite_in_progress
             .store(false, Ordering::SeqCst);
+    }
+
+    fn mark_write_failed(stats: &Arc<AofStatsInner>, err: impl ToString) {
+        stats.write_failed.store(true, Ordering::SeqCst);
+        *stats.last_error.lock().unwrap() = Some(err.to_string());
     }
 
     async fn start_rewrite_buffering(&self) -> anyhow::Result<()> {
@@ -241,7 +281,16 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
             }
             Ok(Some(frame)) => match Command::from_frame(frame) {
                 Ok(cmd) => {
-                    let _ = cmd.apply(db);
+                    let resp = cmd.apply(db);
+                    if let Frame::Error(err) = resp {
+                        tracing::warn!(
+                            error = %err,
+                            offset = frame_start,
+                            "command failed during AOF replay; truncating to valid prefix"
+                        );
+                        truncate_to = Some(frame_start);
+                        break;
+                    }
                     applied += 1;
                     valid_len = all.len() - buf.len();
                 }
@@ -302,13 +351,12 @@ pub async fn spawn_writer(path: PathBuf, policy: FsyncPolicy) -> anyhow::Result<
 }
 
 async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
+    let temp_path = rewrite_temp_path(&handle.path);
     let write_pause = db.pause_writes().await;
     handle.start_rewrite_buffering().await?;
-    let frames = db.aof_snapshot_frames();
+    let write_result = write_snapshot_from_db(&temp_path, &db).await;
     drop(write_pause);
 
-    let temp_path = rewrite_temp_path(&handle.path);
-    let write_result = write_snapshot(&temp_path, frames).await;
     if let Err(err) = write_result {
         handle.abort_rewrite(err.to_string()).await;
         let _ = fs::remove_file(&temp_path).await;
@@ -323,7 +371,7 @@ async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn write_snapshot(path: &Path, frames: Vec<Frame>) -> anyhow::Result<()> {
+async fn write_snapshot_from_db(path: &Path, db: &Db) -> anyhow::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -331,13 +379,88 @@ async fn write_snapshot(path: &Path, frames: Vec<Frame>) -> anyhow::Result<()> {
         .open(path)
         .await?;
     let mut buf = BytesMut::new();
-    for frame in frames {
-        buf.clear();
-        encoder::encode(&frame, &mut buf);
-        file.write_all(&buf).await?;
+    let now = crate::db::now_millis();
+    for shard_mu in db.iter_shards() {
+        let frames = {
+            let shard = shard_mu.lock().unwrap();
+            let mut entries: Vec<(Bytes, Entry)> = shard
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.expires_at.is_some_and(|deadline| deadline <= now))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect();
+            entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+            entries
+                .into_iter()
+                .flat_map(snapshot_frames_for_entry)
+                .collect::<Vec<_>>()
+        };
+
+        for frame in frames {
+            buf.clear();
+            encoder::encode(&frame, &mut buf);
+            file.write_all(&buf).await?;
+        }
     }
     file.sync_data().await?;
     Ok(())
+}
+
+fn snapshot_frames_for_entry((key, entry): (Bytes, Entry)) -> Vec<Frame> {
+    match entry.value {
+        Value::String(value) => {
+            let mut parts = vec![bulk_static(b"SET"), Frame::Bulk(key), Frame::Bulk(value)];
+            if let Some(deadline) = entry.expires_at {
+                parts.push(bulk_static(b"PXAT"));
+                parts.push(bulk_string(deadline));
+            }
+            vec![Frame::Array(parts)]
+        }
+        Value::List(values) if !values.is_empty() => {
+            let mut parts = Vec::with_capacity(values.len() + 2);
+            parts.push(bulk_static(b"RPUSH"));
+            parts.push(Frame::Bulk(key.clone()));
+            parts.extend(values.into_iter().map(Frame::Bulk));
+            let mut frames = vec![Frame::Array(parts)];
+            if let Some(deadline) = entry.expires_at {
+                frames.push(pexpireat_frame(key, deadline));
+            }
+            frames
+        }
+        Value::Hash(values) if !values.is_empty() => {
+            let mut fields: Vec<_> = values.into_iter().collect();
+            fields.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+            let mut parts = Vec::with_capacity(fields.len() * 2 + 2);
+            parts.push(bulk_static(b"HSET"));
+            parts.push(Frame::Bulk(key.clone()));
+            for (field, value) in fields {
+                parts.push(Frame::Bulk(field));
+                parts.push(Frame::Bulk(value));
+            }
+            let mut frames = vec![Frame::Array(parts)];
+            if let Some(deadline) = entry.expires_at {
+                frames.push(pexpireat_frame(key, deadline));
+            }
+            frames
+        }
+        Value::List(_) | Value::Hash(_) => Vec::new(),
+    }
+}
+
+fn bulk_static(bytes: &'static [u8]) -> Frame {
+    Frame::Bulk(Bytes::from_static(bytes))
+}
+
+fn bulk_string(value: impl ToString) -> Frame {
+    Frame::Bulk(Bytes::from(value.to_string()))
+}
+
+fn pexpireat_frame(key: Bytes, deadline: ExpireAt) -> Frame {
+    Frame::Array(vec![
+        bulk_static(b"PEXPIREAT"),
+        Frame::Bulk(key),
+        bulk_string(deadline),
+    ])
 }
 
 async fn run_writer(
@@ -349,7 +472,7 @@ async fn run_writer(
 ) {
     let mut last_sync = tokio::time::Instant::now();
     let sync_interval = std::time::Duration::from_secs(1);
-    let mut rewrite_buffer: Option<Vec<Bytes>> = None;
+    let mut rewrite_buffer: Option<RewriteBuffer> = None;
 
     loop {
         let next = if policy == FsyncPolicy::EverySec {
@@ -357,6 +480,7 @@ async fn run_writer(
                 msg = rx.recv() => msg,
                 _ = tokio::time::sleep_until(last_sync + sync_interval) => {
                     if let Err(e) = file.sync_data().await {
+                        AofHandle::mark_write_failed(&stats, &e);
                         tracing::warn!(error = %e, "AOF fsync failed");
                     }
                     last_sync = tokio::time::Instant::now();
@@ -374,16 +498,36 @@ async fn run_writer(
 
         match message {
             AofMessage::Write { bytes, ack } => {
+                if stats.write_failed.load(Ordering::SeqCst) {
+                    let _ = ack.send(Err(anyhow::anyhow!("AOF writer is in failed state")));
+                    continue;
+                }
                 let result = async {
-                    write_one(&mut file, &stats, &bytes).await?;
-                    if let Some(buffer) = rewrite_buffer.as_mut() {
-                        buffer.push(bytes);
+                    let previous_len = stats.current_size.load(Ordering::SeqCst);
+                    if let Err(err) = write_one(&mut file, &stats, &bytes, previous_len).await {
+                        let _ = rollback_active_file(&mut file, &stats, previous_len).await;
+                        return Err(err);
                     }
-                    sync_after_write(&mut file, policy, &mut last_sync).await
+                    if let Err(err) = sync_after_write(&mut file, policy, &mut last_sync).await {
+                        let _ = rollback_active_file(&mut file, &stats, previous_len).await;
+                        return Err(err);
+                    }
+                    Ok(())
                 }
                 .await;
-                if let Err(e) = &result {
-                    *stats.last_error.lock().unwrap() = Some(e.to_string());
+                if result.is_ok() {
+                    if let Some(buffer) = rewrite_buffer.as_mut() {
+                        if let Err(e) = buffer.push(bytes) {
+                            rewrite_buffer = None;
+                            *stats.last_error.lock().unwrap() = Some(e.to_string());
+                            tracing::warn!(
+                                error = %e,
+                                "aborting AOF rewrite after buffer limit was exceeded"
+                            );
+                        }
+                    }
+                } else if let Err(e) = &result {
+                    AofHandle::mark_write_failed(&stats, e);
                     tracing::error!(error = %e, "AOF write/fsync failed");
                 }
                 let _ = ack.send(result);
@@ -392,7 +536,7 @@ async fn run_writer(
                 let result = if rewrite_buffer.is_some() {
                     Err(anyhow::anyhow!("AOF rewrite already in progress"))
                 } else {
-                    rewrite_buffer = Some(Vec::new());
+                    rewrite_buffer = Some(RewriteBuffer::new());
                     Ok(())
                 };
                 let _ = ack.send(result);
@@ -425,11 +569,23 @@ async fn write_one(
     file: &mut File,
     stats: &Arc<AofStatsInner>,
     bytes: &Bytes,
+    previous_len: u64,
 ) -> anyhow::Result<()> {
     file.write_all(bytes).await?;
     stats
         .current_size
-        .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+        .store(previous_len + bytes.len() as u64, Ordering::SeqCst);
+    Ok(())
+}
+
+async fn rollback_active_file(
+    file: &mut File,
+    stats: &Arc<AofStatsInner>,
+    previous_len: u64,
+) -> anyhow::Result<()> {
+    file.set_len(previous_len).await?;
+    let _ = file.sync_data().await;
+    stats.current_size.store(previous_len, Ordering::SeqCst);
     Ok(())
 }
 
@@ -457,7 +613,7 @@ async fn sync_after_write(
 async fn finish_rewrite_file(
     path: &Path,
     active_file: &mut File,
-    rewrite_buffer: &mut Option<Vec<Bytes>>,
+    rewrite_buffer: &mut Option<RewriteBuffer>,
     temp_path: &Path,
     policy: FsyncPolicy,
     stats: &Arc<AofStatsInner>,
@@ -467,14 +623,14 @@ async fn finish_rewrite_file(
     };
 
     let mut temp = OpenOptions::new().append(true).open(temp_path).await?;
-    for bytes in &buffer {
+    for bytes in &buffer.frames {
         temp.write_all(bytes).await?;
     }
     temp.sync_data().await?;
     drop(temp);
 
     fs::rename(temp_path, path).await?;
-    let _ = sync_parent_dir(path).await;
+    let parent_sync = sync_parent_dir(path).await;
     *active_file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -485,6 +641,7 @@ async fn finish_rewrite_file(
     }
     let len = active_file.metadata().await.map(|m| m.len()).unwrap_or(0);
     stats.current_size.store(len, Ordering::SeqCst);
+    parent_sync?;
     Ok(())
 }
 
