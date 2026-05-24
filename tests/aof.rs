@@ -314,3 +314,33 @@ async fn failed_bgrewriteaof_keeps_old_aof_replayable() {
         assert_eq!(read_n(&mut s, 9).await, b"$3\r\nyes\r\n");
     }
 }
+
+#[tokio::test]
+async fn aof_replay_truncates_partial_tail_before_appending_new_writes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("partial-tail.aof");
+    let mut initial = array(&[b"SET", b"a", b"1"]);
+    initial.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$5\r\nabc");
+    std::fs::write(&path, initial).unwrap();
+
+    {
+        let (addr, shutdown) = spawn_with_aof(path.clone()).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        send(&mut s, &array(&[b"GET", b"a"])).await;
+        assert_eq!(read_n(&mut s, 7).await, b"$1\r\n1\r\n");
+
+        send(&mut s, &array(&[b"SET", b"b", b"2"])).await;
+        assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
+        let _ = shutdown.send(());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    {
+        let (addr, _shutdown) = spawn_with_aof(path.clone()).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        send(&mut s, &array(&[b"GET", b"a"])).await;
+        assert_eq!(read_n(&mut s, 7).await, b"$1\r\n1\r\n");
+        send(&mut s, &array(&[b"GET", b"b"])).await;
+        assert_eq!(read_n(&mut s, 7).await, b"$1\r\n2\r\n");
+    }
+}

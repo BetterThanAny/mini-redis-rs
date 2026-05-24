@@ -81,10 +81,31 @@ fn deeply_nested_array() {
 }
 
 #[test]
+fn nested_array_above_depth_cap_errors() {
+    let mut raw = Vec::new();
+    for _ in 0..140 {
+        raw.extend_from_slice(b"*1\r\n");
+    }
+    raw.extend_from_slice(b"$4\r\nPING\r\n");
+    let mut buf = BytesMut::from(&raw[..]);
+    let err = parser::parse(&mut buf);
+    assert!(err.is_err(), "expected nesting-depth error, got {err:?}");
+}
+
+#[test]
 fn incomplete_simple_returns_none() {
     let mut buf = BytesMut::from(&b"+PON"[..]);
     assert!(parser::parse(&mut buf).unwrap().is_none());
     assert_eq!(&buf[..], b"+PON");
+}
+
+#[test]
+fn unterminated_line_above_cap_errors() {
+    let mut raw = vec![b'a'; 1024 * 1024 + 2];
+    raw[0] = b'+';
+    let mut buf = BytesMut::from(&raw[..]);
+    let err = parser::parse(&mut buf);
+    assert!(err.is_err(), "expected line-length error, got {err:?}");
 }
 
 #[test]

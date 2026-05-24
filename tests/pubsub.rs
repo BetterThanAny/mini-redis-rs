@@ -117,3 +117,14 @@ async fn other_commands_blocked_in_subscribed_mode() {
     let resp = read_some(&mut sub).await;
     assert!(resp.starts_with(b"-ERR"), "got: {:?}", resp);
 }
+
+#[tokio::test]
+async fn publish_is_blocked_in_subscribed_mode() {
+    let (addr, _g) = spawn_server().await;
+    let mut sub = TcpStream::connect(addr).await.unwrap();
+    send(&mut sub, &array(&[b"SUBSCRIBE", b"x"])).await;
+    let _ = read_some(&mut sub).await;
+    send(&mut sub, &array(&[b"PUBLISH", b"x", b"msg"])).await;
+    let resp = read_some(&mut sub).await;
+    assert!(resp.starts_with(b"-ERR"), "got: {:?}", resp);
+}

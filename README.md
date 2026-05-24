@@ -55,7 +55,7 @@ writes, `everysec` may lose up to about one second of acknowledged writes, and
 
 Startup replays the AOF automatically. Tail corruption from a partial frame is
 tolerated: replay stops at the first incomplete or invalid frame and keeps the
-valid prefix.
+valid prefix, truncating the bad tail before accepting new appends.
 
 ### AOF Rewrite
 
@@ -107,8 +107,8 @@ Unsupported Redis commands return `ERR unknown command`.
   `xxhash-rust`.
 - A lightweight DB write gate pauses mutating commands only while AOF rewrite
   takes its snapshot.
-- Streaming RESP2 parser over `BytesMut`, with caps for bulk length and array
-  length.
+- Streaming RESP2 parser over `BytesMut`, with caps for bulk length, array
+  length, nesting depth, and unterminated line length.
 - Active TTL sweeper using a per-shard `BTreeMap<absolute_ms, Vec<Bytes>>`.
 - Pub/Sub fan-out through `tokio::sync::broadcast`.
 - AOF uses a single writer task plus rewrite buffering and atomic replacement.
@@ -121,7 +121,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The integration suite currently has 96 tests covering RESP2 parsing, strings,
+The integration suite currently has 103 tests covering RESP2 parsing, strings,
 lists, hashes, pub/sub, TTL, AOF replay, AOF rewrite, `INFO`, and wire-level
 response shapes for `redis-cli` workflows. GitHub Actions runs fmt, clippy, and
 tests on push and pull request.

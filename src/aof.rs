@@ -64,7 +64,10 @@ pub struct AofStats {
 }
 
 enum AofMessage {
-    Write(Bytes),
+    Write {
+        bytes: Bytes,
+        ack: oneshot::Sender<anyhow::Result<()>>,
+    },
     StartRewrite {
         ack: oneshot::Sender<anyhow::Result<()>>,
     },
@@ -82,15 +85,24 @@ enum AofMessage {
 pub struct AofHandle {
     path: PathBuf,
     policy: FsyncPolicy,
-    sender: mpsc::UnboundedSender<AofMessage>,
+    sender: mpsc::Sender<AofMessage>,
     stats: Arc<AofStatsInner>,
 }
 
 impl AofHandle {
-    pub fn write(&self, frame: &Frame) {
+    pub async fn write(&self, frame: &Frame) -> anyhow::Result<()> {
         let mut buf = BytesMut::new();
         encoder::encode(frame, &mut buf);
-        let _ = self.sender.send(AofMessage::Write(buf.freeze()));
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(AofMessage::Write {
+                bytes: buf.freeze(),
+                ack: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("AOF writer is closed"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("AOF writer stopped during write"))?
     }
 
     pub fn schedule_rewrite(&self, db: Db) -> Result<(), &'static str> {
@@ -171,6 +183,7 @@ impl AofHandle {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(AofMessage::StartRewrite { ack: tx })
+            .await
             .map_err(|_| anyhow::anyhow!("AOF writer is closed"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("AOF writer stopped during rewrite start"))?
@@ -180,6 +193,7 @@ impl AofHandle {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(AofMessage::FinishRewrite { temp_path, ack: tx })
+            .await
             .map_err(|_| anyhow::anyhow!("AOF writer is closed"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("AOF writer stopped during rewrite finish"))?
@@ -187,10 +201,13 @@ impl AofHandle {
 
     async fn abort_rewrite(&self, reason: impl Into<String>) {
         let (tx, rx) = oneshot::channel();
-        let _ = self.sender.send(AofMessage::AbortRewrite {
-            reason: reason.into(),
-            ack: tx,
-        });
+        let _ = self
+            .sender
+            .send(AofMessage::AbortRewrite {
+                reason: reason.into(),
+                ack: tx,
+            })
+            .await;
         let _ = rx.await;
     }
 }
@@ -207,7 +224,10 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
 
     let mut buf = BytesMut::from(&all[..]);
     let mut applied = 0u64;
+    let mut valid_len = 0usize;
+    let mut truncate_to = None;
     while !buf.is_empty() {
+        let frame_start = all.len() - buf.len();
         // Tolerate corruption in the tail: warn and stop, do NOT propagate the error
         // (otherwise the server can never restart on a partially-trashed AOF).
         match parser::parse(&mut buf) {
@@ -216,15 +236,23 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
                     remaining = buf.len(),
                     "AOF truncated mid-frame; stopping replay"
                 );
+                truncate_to = Some(valid_len);
                 break;
             }
             Ok(Some(frame)) => match Command::from_frame(frame) {
                 Ok(cmd) => {
                     let _ = cmd.apply(db);
                     applied += 1;
+                    valid_len = all.len() - buf.len();
                 }
                 Err(e) => {
-                    tracing::warn!(?e, "skipping bad frame during AOF replay");
+                    tracing::warn!(
+                        ?e,
+                        offset = frame_start,
+                        "bad command frame during AOF replay; truncating to valid prefix"
+                    );
+                    truncate_to = Some(frame_start);
+                    break;
                 }
             },
             Err(e) => {
@@ -233,8 +261,20 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
                     remaining = buf.len(),
                     "AOF parse error; stopping replay"
                 );
+                truncate_to = Some(valid_len);
                 break;
             }
+        }
+    }
+    if let Some(len) = truncate_to {
+        if len < all.len() {
+            truncate_aof(path, len as u64).await?;
+            tracing::warn!(
+                ?path,
+                original_len = all.len(),
+                truncated_len = len,
+                "AOF truncated to replayable prefix"
+            );
         }
     }
     tracing::info!(applied, ?path, "AOF replay done");
@@ -249,7 +289,7 @@ pub async fn spawn_writer(path: PathBuf, policy: FsyncPolicy) -> anyhow::Result<
         .open(&path)
         .await?;
     let current_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-    let (tx, rx) = mpsc::unbounded_channel::<AofMessage>();
+    let (tx, rx) = mpsc::channel::<AofMessage>(1024);
     let stats = Arc::new(AofStatsInner::default());
     stats.current_size.store(current_size, Ordering::SeqCst);
     tokio::spawn(run_writer(path.clone(), file, rx, policy, stats.clone()));
@@ -303,7 +343,7 @@ async fn write_snapshot(path: &Path, frames: Vec<Frame>) -> anyhow::Result<()> {
 async fn run_writer(
     path: PathBuf,
     mut file: File,
-    mut rx: mpsc::UnboundedReceiver<AofMessage>,
+    mut rx: mpsc::Receiver<AofMessage>,
     policy: FsyncPolicy,
     stats: Arc<AofStatsInner>,
 ) {
@@ -333,17 +373,20 @@ async fn run_writer(
         };
 
         match message {
-            AofMessage::Write(bytes) => {
-                if let Err(e) = write_one(&mut file, &stats, &bytes).await {
-                    tracing::error!(error = %e, "AOF write failed");
-                    continue;
+            AofMessage::Write { bytes, ack } => {
+                let result = async {
+                    write_one(&mut file, &stats, &bytes).await?;
+                    if let Some(buffer) = rewrite_buffer.as_mut() {
+                        buffer.push(bytes);
+                    }
+                    sync_after_write(&mut file, policy, &mut last_sync).await
                 }
-                if let Some(buffer) = rewrite_buffer.as_mut() {
-                    buffer.push(bytes);
+                .await;
+                if let Err(e) = &result {
+                    *stats.last_error.lock().unwrap() = Some(e.to_string());
+                    tracing::error!(error = %e, "AOF write/fsync failed");
                 }
-                if let Err(e) = sync_after_write(&mut file, policy, &mut last_sync).await {
-                    tracing::warn!(error = %e, "AOF fsync failed");
-                }
+                let _ = ack.send(result);
             }
             AofMessage::StartRewrite { ack } => {
                 let result = if rewrite_buffer.is_some() {
@@ -462,4 +505,11 @@ fn rewrite_temp_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| "appendonly.aof".into());
     name.push(".rewrite");
     path.with_file_name(name)
+}
+
+async fn truncate_aof(path: &Path, len: u64) -> anyhow::Result<()> {
+    let file = OpenOptions::new().write(true).open(path).await?;
+    file.set_len(len).await?;
+    file.sync_data().await?;
+    Ok(())
 }

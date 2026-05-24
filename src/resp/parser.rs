@@ -6,10 +6,15 @@ const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 /// Sensible cap on array length (1M elements) — without this a malicious
 /// `*999999999\r\n` would `Vec::with_capacity` ~tens of GB.
 const MAX_ARRAY_LEN: usize = 1024 * 1024;
+/// Cap nested arrays so a hostile client cannot stack-overflow the parser.
+const MAX_NESTING_DEPTH: usize = 128;
+/// RESP line headers are tiny in normal Redis traffic. Without a cap, a client
+/// can stream an unterminated line forever and grow the input buffer unboundedly.
+const MAX_LINE_LEN: usize = 1024 * 1024;
 
 pub fn parse(buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
     let mut cursor = std::io::Cursor::new(&buf[..]);
-    match parse_frame(&mut cursor) {
+    match parse_frame(&mut cursor, 0) {
         Ok(frame) => {
             let n = cursor.position() as usize;
             buf.advance(n);
@@ -20,14 +25,19 @@ pub fn parse(buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
     }
 }
 
-fn parse_frame(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
+fn parse_frame(c: &mut std::io::Cursor<&[u8]>, depth: usize) -> Result<Frame, Error> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(Error::Protocol(format!(
+            "array nesting depth exceeds limit {MAX_NESTING_DEPTH}"
+        )));
+    }
     let tag = read_u8(c)?;
     match tag {
         b'+' => Ok(Frame::Simple(read_line_string(c)?)),
         b'-' => Ok(Frame::Error(read_line_string(c)?)),
         b':' => Ok(Frame::Integer(read_line_int(c)?)),
         b'$' => parse_bulk(c),
-        b'*' => parse_array(c),
+        b'*' => parse_array(c, depth),
         other => Err(Error::Protocol(format!("invalid type byte: 0x{other:02x}"))),
     }
 }
@@ -56,7 +66,7 @@ fn parse_bulk(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
     Ok(Frame::Bulk(bytes))
 }
 
-fn parse_array(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
+fn parse_array(c: &mut std::io::Cursor<&[u8]>, depth: usize) -> Result<Frame, Error> {
     let count = read_line_int(c)?;
     if count == -1 {
         return Ok(Frame::Null);
@@ -69,7 +79,7 @@ fn parse_array(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
     }
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        items.push(parse_frame(c)?);
+        items.push(parse_frame(c, depth + 1)?);
     }
     Ok(Frame::Array(items))
 }
@@ -91,7 +101,15 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 fn read_line<'a>(c: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a [u8], Error> {
     let start = c.position() as usize;
     let buf: &'a [u8] = c.get_ref();
-    let crlf = find_crlf(buf, start).ok_or(Error::Incomplete)?;
+    let crlf = match find_crlf(buf, start) {
+        Some(crlf) => crlf,
+        None if buf.len().saturating_sub(start) > MAX_LINE_LEN => {
+            return Err(Error::Protocol(format!(
+                "line length exceeds limit {MAX_LINE_LEN}"
+            )));
+        }
+        None => return Err(Error::Incomplete),
+    };
     c.set_position((crlf + 2) as u64);
     Ok(&buf[start..crlf])
 }

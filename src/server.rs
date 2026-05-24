@@ -13,6 +13,8 @@ use std::sync::{
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+const PUBSUB_OUTPUT_CAP: usize = 1024;
+
 pub(crate) struct ServerState {
     connected_clients: AtomicUsize,
     total_connections: AtomicU64,
@@ -110,10 +112,17 @@ async fn handle(
                     let resp = cmd.apply(&db);
                     if !matches!(resp, Frame::Error(_)) {
                         if let (Some(a), Some(frame)) = (&aof, &aof_frame) {
-                            a.write(frame);
+                            if let Err(e) = a.write(frame).await {
+                                Frame::Error(format!("ERR AOF write failed: {e}"))
+                            } else {
+                                resp
+                            }
+                        } else {
+                            resp
                         }
+                    } else {
+                        resp
                     }
-                    resp
                 } else {
                     cmd.apply(&db)
                 };
@@ -258,7 +267,7 @@ async fn run_subscribed(
     db: &Db,
     initial_channels: Vec<Bytes>,
 ) -> anyhow::Result<()> {
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<(Bytes, Bytes)>();
+    let (msg_tx, mut msg_rx) = mpsc::channel::<(Bytes, Bytes)>(PUBSUB_OUTPUT_CAP);
     let mut tasks: HashMap<Bytes, tokio::task::JoinHandle<()>> = HashMap::new();
 
     for ch in initial_channels {
@@ -293,6 +302,8 @@ async fn run_subscribed(
                         for ch in chs {
                             if let Some(h) = tasks.remove(&ch) {
                                 h.abort();
+                                let _ = h.await;
+                                db.pubsub_gc(&ch);
                             }
                             ack_subscribe(conn, b"unsubscribe", &ch, tasks.len()).await?;
                         }
@@ -306,10 +317,6 @@ async fn run_subscribed(
                             Frame::Bulk(Bytes::from_static(b"pong")),
                             Frame::Bulk(payload),
                         ])).await?;
-                    }
-                    Ok(Command::Publish(ch, msg)) => {
-                        let n = db.pubsub_publish(&ch, msg);
-                        conn.write_frame(&Frame::Integer(n as i64)).await?;
                     }
                     Ok(_) => {
                         conn.write_frame(&Frame::Error(
@@ -332,22 +339,17 @@ async fn run_subscribed(
         }
     }
 
-    let channels: Vec<Bytes> = tasks.keys().cloned().collect();
-    for (_, h) in tasks {
+    for (ch, h) in tasks {
         h.abort();
-    }
-    // Yield once so the aborted forwarder tasks actually drop their broadcast::Receivers
-    // before we try to GC the channels (best-effort; pubsub_publish also GCs lazily).
-    tokio::task::yield_now().await;
-    for ch in &channels {
-        db.pubsub_gc(ch);
+        let _ = h.await;
+        db.pubsub_gc(&ch);
     }
     Ok(())
 }
 
 fn subscribe_one(
     tasks: &mut HashMap<Bytes, tokio::task::JoinHandle<()>>,
-    msg_tx: &mpsc::UnboundedSender<(Bytes, Bytes)>,
+    msg_tx: &mpsc::Sender<(Bytes, Bytes)>,
     db: &Db,
     channel: Bytes,
 ) {
@@ -361,7 +363,7 @@ fn subscribe_one(
         loop {
             match rx.recv().await {
                 Ok(msg) => {
-                    if tx.send((ch_for_task.clone(), msg)).is_err() {
+                    if tx.send((ch_for_task.clone(), msg)).await.is_err() {
                         return;
                     }
                 }

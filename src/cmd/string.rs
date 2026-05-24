@@ -208,12 +208,7 @@ pub fn ttl(db: &Db, key: &Bytes, in_ms: bool) -> Frame {
                     if in_ms {
                         Frame::Integer((t - now) as i64)
                     } else {
-                        // Round up partial seconds so e.g. 1.2s remaining returns 2,
-                        // matching Redis semantics for fresh `EXPIRE k 30`.
-                        let remaining_ms = t - now;
-                        let secs =
-                            (remaining_ms / 1000) as i64 + i64::from(remaining_ms % 1000 > 0);
-                        Frame::Integer(secs)
+                        Frame::Integer(((t - now) / 1000) as i64)
                     }
                 }
             }

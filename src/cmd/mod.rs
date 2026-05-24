@@ -525,12 +525,17 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
     let key = it.next().unwrap();
     let value = it.next().unwrap();
     let mut expires_at: Option<ExpireAt> = None;
+    let mut expiry_seen = false;
     while let Some(opt) = it.next() {
         let opt_upper = std::str::from_utf8(&opt)
             .map_err(|_| ParseError::Syntax)?
             .to_ascii_uppercase();
         match opt_upper.as_str() {
             "EX" => {
+                if expiry_seen {
+                    return Err(ParseError::Syntax);
+                }
+                expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
                 let n = parse_i64(&n_bytes)?;
                 if n <= 0 {
@@ -539,6 +544,10 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 expires_at = Some(now_millis() + Duration::from_secs(n as u64).as_millis());
             }
             "PX" => {
+                if expiry_seen {
+                    return Err(ParseError::Syntax);
+                }
+                expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
                 let n = parse_i64(&n_bytes)?;
                 if n <= 0 {
@@ -547,11 +556,19 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 expires_at = Some(now_millis() + n as ExpireAt);
             }
             "EXAT" => {
+                if expiry_seen {
+                    return Err(ParseError::Syntax);
+                }
+                expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
                 let n = parse_u128(&n_bytes)?;
                 expires_at = Some(n.saturating_mul(1000));
             }
             "PXAT" => {
+                if expiry_seen {
+                    return Err(ParseError::Syntax);
+                }
+                expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
                 expires_at = Some(parse_u128(&n_bytes)?);
             }
@@ -572,10 +589,9 @@ fn parse_expire(rest: Vec<Bytes>, name: &str, ms: bool) -> Result<(Bytes, Expire
     let mut it = rest.into_iter();
     let key = it.next().unwrap();
     let n = parse_i64(&it.next().unwrap())?;
-    if n < 0 {
-        return Err(ParseError::Syntax);
-    }
-    let deadline = if ms {
+    let deadline = if n <= 0 {
+        0
+    } else if ms {
         now_millis() + n as ExpireAt
     } else {
         now_millis() + Duration::from_secs(n as u64).as_millis()
@@ -593,8 +609,14 @@ fn parse_expire_at(
     }
     let mut it = rest.into_iter();
     let key = it.next().unwrap();
-    let n = parse_u128(&it.next().unwrap())?;
-    let deadline = if ms { n } else { n.saturating_mul(1000) };
+    let n = parse_i128(&it.next().unwrap())?;
+    let deadline = if n <= 0 {
+        0
+    } else if ms {
+        n as ExpireAt
+    } else {
+        (n as ExpireAt).saturating_mul(1000)
+    };
     Ok((key, deadline))
 }
 
@@ -678,6 +700,13 @@ fn parse_i64(b: &[u8]) -> Result<i64, ParseError> {
 }
 
 fn parse_u128(b: &[u8]) -> Result<u128, ParseError> {
+    std::str::from_utf8(b)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(ParseError::NotInt)
+}
+
+fn parse_i128(b: &[u8]) -> Result<i128, ParseError> {
     std::str::from_utf8(b)
         .ok()
         .and_then(|s| s.parse().ok())

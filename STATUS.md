@@ -160,8 +160,8 @@ mini-redis-rs/
 
 1. **Read this file first** (you are here).
 2. **`git log --oneline`** — see the 15-commit story.
-3. **`cargo test`** — confirm 89/89 still green.
+3. **`cargo test`** — confirm the integration suite still passes.
 4. If picking up further work, the most worthwhile next things are:
-   - **C2 fix**: make AOF writes synchronously ack-blocking under `appendfsync=always`. Touch points: `src/aof.rs` (`AofHandle::write` becomes async with oneshot), `src/server.rs::handle` (await AOF before `conn.write_frame(&resp)`).
+   - **AOF scaling**: replay still reads the full AOF into memory, and rewrite still snapshots the full DB before writing; make those paths streaming if the project grows beyond teaching-scale datasets.
    - **Sorted sets (Phase 2)**: requires a sorted data structure (BTreeMap of score→Vec<Bytes> + HashMap of member→score), then ZADD/ZRANGE/ZRANGEBYSCORE/ZREM/ZRANGEBYLEX. Probably its own milestone-sized chunk.
    - **Cluster mode** is interesting but a much bigger lift (slot routing, gossip, MOVED redirects).

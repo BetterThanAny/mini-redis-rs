@@ -5,7 +5,7 @@ mod common;
 use bytes::Bytes;
 use common::{array, read_n, read_some, send, spawn_server};
 use mini_redis_rs::cmd::string;
-use mini_redis_rs::db::Db;
+use mini_redis_rs::db::{now_millis, Db};
 use mini_redis_rs::resp::Frame;
 
 fn key(s: &'static str) -> Bytes {
@@ -48,8 +48,59 @@ async fn set_ex_then_ttl() {
     assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
     send(&mut s, &array(&[b"TTL", b"k"])).await;
     let resp = read_some(&mut s).await;
-    // Should report 29 or 30 (we round-up partial seconds)
+    // Redis floors TTL seconds, so a fresh 30s TTL can report 30 or 29.
     assert!(resp == b":30\r\n" || resp == b":29\r\n", "got: {:?}", resp);
+}
+
+#[tokio::test]
+async fn set_rejects_multiple_expiry_options() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    send(
+        &mut s,
+        &array(&[b"SET", b"k", b"v", b"EX", b"10", b"PX", b"10000"]),
+    )
+    .await;
+    let resp = read_some(&mut s).await;
+    assert!(resp.starts_with(b"-ERR syntax error"), "got: {:?}", resp);
+
+    send(&mut s, &array(&[b"GET", b"k"])).await;
+    assert_eq!(read_n(&mut s, 5).await, b"$-1\r\n");
+}
+
+#[tokio::test]
+async fn negative_expire_deletes_existing_key() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    for cmd in [
+        b"EXPIRE".as_slice(),
+        b"PEXPIRE".as_slice(),
+        b"EXPIREAT".as_slice(),
+        b"PEXPIREAT".as_slice(),
+    ] {
+        send(&mut s, &array(&[b"SET", b"k", b"v"])).await;
+        assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
+        send(&mut s, &array(&[cmd, b"k", b"-1"])).await;
+        assert_eq!(read_n(&mut s, 4).await, b":1\r\n");
+        send(&mut s, &array(&[b"GET", b"k"])).await;
+        assert_eq!(read_n(&mut s, 5).await, b"$-1\r\n");
+    }
+}
+
+#[tokio::test]
+async fn ttl_seconds_floor_subsecond_remaining() {
+    let db = Db::new();
+    let k = key("ttl-floor");
+    assert_eq!(
+        string::set_at(
+            &db,
+            k.clone(),
+            Bytes::from_static(b"v"),
+            Some(now_millis() + 500)
+        ),
+        Frame::Simple("OK".into())
+    );
+    assert_eq!(string::ttl(&db, &k, false), Frame::Integer(0));
 }
 
 #[tokio::test]
