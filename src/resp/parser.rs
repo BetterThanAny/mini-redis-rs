@@ -69,7 +69,7 @@ fn parse_bulk(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
 fn parse_array(c: &mut std::io::Cursor<&[u8]>, depth: usize) -> Result<Frame, Error> {
     let count = read_line_int(c)?;
     if count == -1 {
-        return Ok(Frame::Null);
+        return Ok(Frame::NullArray);
     }
     let count = usize::try_from(count).map_err(|_| Error::Protocol("negative array len".into()))?;
     if count > MAX_ARRAY_LEN {

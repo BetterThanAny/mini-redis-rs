@@ -11,14 +11,16 @@ use std::sync::{
     Arc,
 };
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
+const MAX_CLIENTS: usize = 1024;
 const PUBSUB_OUTPUT_CAP: usize = 1024;
 
 pub(crate) struct ServerState {
     connected_clients: AtomicUsize,
     total_connections: AtomicU64,
     started_at_ms: u64,
+    client_slots: Arc<Semaphore>,
 }
 
 impl ServerState {
@@ -27,6 +29,7 @@ impl ServerState {
             connected_clients: AtomicUsize::new(0),
             total_connections: AtomicU64::new(0),
             started_at_ms: crate::db::now_millis() as u64,
+            client_slots: Arc::new(Semaphore::new(MAX_CLIENTS)),
         }
     }
 }
@@ -63,10 +66,17 @@ async fn accept_loop(
         let db = db.clone();
         let aof = aof.clone();
         let state = state.clone();
+        let permit = match state.client_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(?peer, max_clients = MAX_CLIENTS, "rejecting connection");
+                continue;
+            }
+        };
         state.total_connections.fetch_add(1, Ordering::SeqCst);
         tracing::debug!(?peer, "accepted");
         tokio::spawn(async move {
-            let _guard = ClientGuard::new(state.clone());
+            let _guard = ClientGuard::new(state.clone(), permit);
             if let Err(e) = handle(socket, db, aof, state).await {
                 tracing::warn!(?peer, error = %e, "connection ended with error");
             }
@@ -87,8 +97,10 @@ async fn handle(
                 run_subscribed(&mut conn, &db, channels).await?;
             }
             Ok(Command::Info(section)) => {
-                let _read_guard = db.write_guard().await;
-                let resp = info_frame(&db, aof.as_ref(), Some(&state), section.as_deref());
+                let resp = {
+                    let _read_guard = db.write_guard().await;
+                    info_frame(&db, aof.as_ref(), Some(&state), section.as_deref())
+                };
                 conn.write_frame(&resp).await?;
             }
             Ok(Command::BgRewriteAof) => {
@@ -149,12 +161,16 @@ async fn handle(
 
 struct ClientGuard {
     state: Arc<ServerState>,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl ClientGuard {
-    fn new(state: Arc<ServerState>) -> Self {
+    fn new(state: Arc<ServerState>, permit: OwnedSemaphorePermit) -> Self {
         state.connected_clients.fetch_add(1, Ordering::SeqCst);
-        Self { state }
+        Self {
+            state,
+            _permit: permit,
+        }
     }
 }
 

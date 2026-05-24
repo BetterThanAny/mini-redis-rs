@@ -58,7 +58,7 @@ fn pop(db: &Db, key: &Bytes, count: Option<usize>, side: PopSide) -> Frame {
         None => {
             return match count {
                 None => Frame::Null,
-                Some(_) => Frame::Null,
+                Some(_) => Frame::NullArray,
             }
         }
     };

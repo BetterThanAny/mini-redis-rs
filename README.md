@@ -83,8 +83,11 @@ Rewrite behavior:
 - Rewrite creates a compact temporary AOF from a consistent DB snapshot.
 - Writes that happen during rewrite are buffered and appended to the temporary
   AOF before the final switch.
-- The final replacement uses atomic `rename` on the same filesystem.
-- If rewrite fails, the old AOF remains active and replayable.
+- The final replacement uses atomic `rename` on the same filesystem and then
+  fsyncs the parent directory.
+- If rewrite fails before the final replacement, the old AOF remains active and
+  replayable. After `rename` succeeds, the compacted AOF is the active file even
+  if a later directory fsync/open step reports an operational error.
 
 ## TTL Semantics
 
@@ -134,7 +137,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The integration suite currently has 105 tests covering RESP2 parsing, strings,
+The integration suite currently has 109 tests covering RESP2 parsing, strings,
 lists, hashes, pub/sub, TTL, AOF replay, AOF rewrite, `INFO`, and wire-level
 response shapes for `redis-cli` workflows. GitHub Actions runs fmt, clippy, and
 tests on push and pull request.

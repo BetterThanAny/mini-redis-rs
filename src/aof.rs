@@ -259,68 +259,85 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
         return Ok(0);
     }
     let mut f = File::open(path).await?;
-    let mut all = Vec::new();
-    f.read_to_end(&mut all).await?;
-
-    let mut buf = BytesMut::from(&all[..]);
+    let original_len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let mut buf = BytesMut::with_capacity(8192);
     let mut applied = 0u64;
-    let mut valid_len = 0usize;
-    let mut truncate_to = None;
-    while !buf.is_empty() {
-        let frame_start = all.len() - buf.len();
-        // Tolerate corruption in the tail: warn and stop, do NOT propagate the error
-        // (otherwise the server can never restart on a partially-trashed AOF).
-        match parser::parse(&mut buf) {
-            Ok(None) => {
+    let mut total_read = 0u64;
+    let mut valid_len = 0u64;
+    let mut truncate_to: Option<u64> = None;
+    let mut eof = false;
+    loop {
+        while !buf.is_empty() {
+            let frame_start = total_read - buf.len() as u64;
+            // Tolerate corruption in the tail: warn and stop, do NOT propagate the error
+            // (otherwise the server can never restart on a partially-trashed AOF).
+            match parser::parse(&mut buf) {
+                Ok(None) => break,
+                Ok(Some(frame)) => match Command::from_frame(frame) {
+                    Ok(cmd) => {
+                        let resp = cmd.apply(db);
+                        if let Frame::Error(err) = resp {
+                            tracing::warn!(
+                                error = %err,
+                                offset = frame_start,
+                                "command failed during AOF replay; truncating to valid prefix"
+                            );
+                            truncate_to = Some(frame_start);
+                            break;
+                        }
+                        applied += 1;
+                        valid_len = total_read - buf.len() as u64;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            ?e,
+                            offset = frame_start,
+                            "bad command frame during AOF replay; truncating to valid prefix"
+                        );
+                        truncate_to = Some(frame_start);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        ?e,
+                        offset = frame_start,
+                        remaining = buf.len(),
+                        "AOF parse error; stopping replay"
+                    );
+                    truncate_to = Some(valid_len);
+                    break;
+                }
+            }
+        }
+
+        if truncate_to.is_some() {
+            break;
+        }
+        if eof {
+            if !buf.is_empty() {
                 tracing::warn!(
                     remaining = buf.len(),
                     "AOF truncated mid-frame; stopping replay"
                 );
                 truncate_to = Some(valid_len);
-                break;
             }
-            Ok(Some(frame)) => match Command::from_frame(frame) {
-                Ok(cmd) => {
-                    let resp = cmd.apply(db);
-                    if let Frame::Error(err) = resp {
-                        tracing::warn!(
-                            error = %err,
-                            offset = frame_start,
-                            "command failed during AOF replay; truncating to valid prefix"
-                        );
-                        truncate_to = Some(frame_start);
-                        break;
-                    }
-                    applied += 1;
-                    valid_len = all.len() - buf.len();
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        ?e,
-                        offset = frame_start,
-                        "bad command frame during AOF replay; truncating to valid prefix"
-                    );
-                    truncate_to = Some(frame_start);
-                    break;
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    ?e,
-                    remaining = buf.len(),
-                    "AOF parse error; stopping replay"
-                );
-                truncate_to = Some(valid_len);
-                break;
-            }
+            break;
+        }
+
+        let n = f.read_buf(&mut buf).await?;
+        if n == 0 {
+            eof = true;
+        } else {
+            total_read += n as u64;
         }
     }
     if let Some(len) = truncate_to {
-        if len < all.len() {
-            truncate_aof(path, len as u64).await?;
+        if len < original_len {
+            truncate_aof(path, len).await?;
             tracing::warn!(
                 ?path,
-                original_len = all.len(),
+                original_len,
                 truncated_len = len,
                 "AOF truncated to replayable prefix"
             );

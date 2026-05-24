@@ -55,6 +55,11 @@ fn null_bulk() {
 }
 
 #[test]
+fn null_array() {
+    roundtrip(Frame::NullArray);
+}
+
+#[test]
 fn empty_array() {
     roundtrip(Frame::Array(vec![]));
 }

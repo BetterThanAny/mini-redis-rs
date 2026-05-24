@@ -69,6 +69,50 @@ async fn set_rejects_multiple_expiry_options() {
 }
 
 #[tokio::test]
+async fn set_rejects_invalid_expire_times_without_writing() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+
+    for cmd in [
+        array(&[b"SET", b"k", b"v", b"EX", b"0"]),
+        array(&[b"SET", b"k", b"v", b"PX", b"0"]),
+        array(&[b"SET", b"k", b"v", b"EXAT", b"0"]),
+        array(&[b"SET", b"k", b"v", b"PXAT", b"0"]),
+        array(&[b"SET", b"k", b"v", b"EX", b"9223372036854775807"]),
+        array(&[b"SET", b"k", b"v", b"EXAT", b"9223372036854775807"]),
+    ] {
+        send(&mut s, &cmd).await;
+        let resp = read_some(&mut s).await;
+        assert!(
+            resp.starts_with(b"-ERR invalid expire time in 'set' command"),
+            "got: {:?}",
+            resp
+        );
+
+        send(&mut s, &array(&[b"GET", b"k"])).await;
+        assert_eq!(read_n(&mut s, 5).await, b"$-1\r\n");
+    }
+
+    send(
+        &mut s,
+        &array(&[
+            b"SET",
+            b"k",
+            b"v",
+            b"PXAT",
+            b"340282366920938463463374607431768211455",
+        ]),
+    )
+    .await;
+    let resp = read_some(&mut s).await;
+    assert!(
+        resp.starts_with(b"-ERR value is not an integer or out of range"),
+        "got: {:?}",
+        resp
+    );
+}
+
+#[tokio::test]
 async fn negative_expire_deletes_existing_key() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
@@ -151,6 +195,46 @@ async fn expire_on_missing_key_returns_zero() {
     let mut s = TcpStream::connect(addr).await.unwrap();
     send(&mut s, &array(&[b"EXPIRE", b"missing", b"30"])).await;
     assert_eq!(read_n(&mut s, 4).await, b":0\r\n");
+}
+
+#[tokio::test]
+async fn expire_rejects_deadlines_outside_i64_millis_range() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    send(&mut s, &array(&[b"SET", b"k", b"v"])).await;
+    assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
+
+    for (cmd, expected) in [
+        (
+            array(&[b"EXPIRE", b"k", b"9223372036854775807"]),
+            b"-ERR invalid expire time in 'expire' command".as_slice(),
+        ),
+        (
+            array(&[b"PEXPIRE", b"k", b"9223372036854775807"]),
+            b"-ERR invalid expire time in 'pexpire' command".as_slice(),
+        ),
+        (
+            array(&[b"EXPIREAT", b"k", b"9223372036854775807"]),
+            b"-ERR invalid expire time in 'expireat' command".as_slice(),
+        ),
+    ] {
+        send(&mut s, &cmd).await;
+        let resp = read_some(&mut s).await;
+        assert!(resp.starts_with(expected), "got: {:?}", resp);
+        send(&mut s, &array(&[b"TTL", b"k"])).await;
+        assert_eq!(read_n(&mut s, 5).await, b":-1\r\n");
+    }
+
+    send(
+        &mut s,
+        &array(&[b"PEXPIREAT", b"k", b"9223372036854775807"]),
+    )
+    .await;
+    assert_eq!(read_n(&mut s, 4).await, b":1\r\n");
+    send(&mut s, &array(&[b"PTTL", b"k"])).await;
+    let resp = read_some(&mut s).await;
+    assert!(resp.starts_with(b":"), "got: {:?}", resp);
+    assert!(!resp.starts_with(b":-"), "got: {:?}", resp);
 }
 
 #[tokio::test]

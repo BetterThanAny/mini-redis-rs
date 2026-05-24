@@ -26,6 +26,7 @@ pub fn encode(frame: &Frame, out: &mut BytesMut) {
             out.put_slice(b"\r\n");
         }
         Frame::Null => out.put_slice(b"$-1\r\n"),
+        Frame::NullArray => out.put_slice(b"*-1\r\n"),
         Frame::Array(items) => {
             out.put_u8(b'*');
             out.put_slice(items.len().to_string().as_bytes());

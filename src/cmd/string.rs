@@ -203,9 +203,9 @@ pub fn ttl(db: &Db, key: &Bytes, in_ms: bool) -> Frame {
                     Frame::Integer(-2)
                 } else {
                     if in_ms {
-                        Frame::Integer((t - now) as i64)
+                        Frame::Integer(i64::try_from(t - now).unwrap_or(i64::MAX))
                     } else {
-                        Frame::Integer(((t - now) / 1000) as i64)
+                        Frame::Integer(i64::try_from((t - now) / 1000).unwrap_or(i64::MAX))
                     }
                 }
             }

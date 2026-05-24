@@ -10,6 +10,7 @@ pub enum Frame {
     Integer(i64),
     Bulk(Bytes),
     Null,
+    NullArray,
     Array(Vec<Frame>),
 }
 

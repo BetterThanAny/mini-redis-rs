@@ -65,6 +65,18 @@ async fn lpop_on_empty_returns_null() {
 }
 
 #[tokio::test]
+async fn pop_missing_with_count_returns_null_array() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+
+    send(&mut s, &array(&[b"LPOP", b"missing", b"2"])).await;
+    assert_eq!(read_n(&mut s, 5).await, b"*-1\r\n");
+
+    send(&mut s, &array(&[b"RPOP", b"missing", b"0"])).await;
+    assert_eq!(read_n(&mut s, 5).await, b"*-1\r\n");
+}
+
+#[tokio::test]
 async fn llen_works() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();

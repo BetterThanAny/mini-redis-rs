@@ -5,7 +5,9 @@ pub mod string;
 use crate::db::{now_millis, Db, ExpireAt};
 use crate::resp::Frame;
 use bytes::Bytes;
-use std::time::Duration;
+
+const MAX_EXPIRE_AT_MS: ExpireAt = i64::MAX as ExpireAt;
+const MILLIS_PER_SECOND: ExpireAt = 1000;
 
 #[derive(Debug)]
 pub enum Command {
@@ -284,6 +286,8 @@ pub enum ParseError {
     BadName,
     #[error("value is not an integer or out of range")]
     NotInt,
+    #[error("invalid expire time in '{0}' command")]
+    InvalidExpireTime(String),
     #[error("syntax error")]
     Syntax,
 }
@@ -586,10 +590,7 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
                 let n = parse_i64(&n_bytes)?;
-                if n <= 0 {
-                    return Err(ParseError::Syntax);
-                }
-                expires_at = Some(now_millis() + Duration::from_secs(n as u64).as_millis());
+                expires_at = Some(set_relative_deadline(n, false, name)?);
             }
             "PX" => {
                 if expiry_seen {
@@ -598,10 +599,7 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
                 let n = parse_i64(&n_bytes)?;
-                if n <= 0 {
-                    return Err(ParseError::Syntax);
-                }
-                expires_at = Some(now_millis() + n as ExpireAt);
+                expires_at = Some(set_relative_deadline(n, true, name)?);
             }
             "EXAT" => {
                 if expiry_seen {
@@ -609,8 +607,8 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 }
                 expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
-                let n = parse_u128(&n_bytes)?;
-                expires_at = Some(n.saturating_mul(1000));
+                let n = parse_i64(&n_bytes)?;
+                expires_at = Some(set_absolute_deadline(n, false, name)?);
             }
             "PXAT" => {
                 if expiry_seen {
@@ -618,7 +616,8 @@ fn parse_set(rest: Vec<Bytes>, name: &str) -> Result<Command, ParseError> {
                 }
                 expiry_seen = true;
                 let n_bytes = it.next().ok_or(ParseError::Syntax)?;
-                expires_at = Some(parse_u128(&n_bytes)?);
+                let n = parse_i64(&n_bytes)?;
+                expires_at = Some(set_absolute_deadline(n, true, name)?);
             }
             _ => return Err(ParseError::Syntax),
         }
@@ -637,13 +636,7 @@ fn parse_expire(rest: Vec<Bytes>, name: &str, ms: bool) -> Result<(Bytes, Expire
     let mut it = rest.into_iter();
     let key = it.next().unwrap();
     let n = parse_i64(&it.next().unwrap())?;
-    let deadline = if n <= 0 {
-        0
-    } else if ms {
-        now_millis() + n as ExpireAt
-    } else {
-        now_millis() + Duration::from_secs(n as u64).as_millis()
-    };
+    let deadline = expire_relative_deadline(n, ms, name)?;
     Ok((key, deadline))
 }
 
@@ -657,14 +650,8 @@ fn parse_expire_at(
     }
     let mut it = rest.into_iter();
     let key = it.next().unwrap();
-    let n = parse_i128(&it.next().unwrap())?;
-    let deadline = if n <= 0 {
-        0
-    } else if ms {
-        n as ExpireAt
-    } else {
-        (n as ExpireAt).saturating_mul(1000)
-    };
+    let n = parse_i64(&it.next().unwrap())?;
+    let deadline = expire_absolute_deadline(n, ms, name)?;
     Ok((key, deadline))
 }
 
@@ -747,18 +734,64 @@ fn parse_i64(b: &[u8]) -> Result<i64, ParseError> {
         .ok_or(ParseError::NotInt)
 }
 
-fn parse_u128(b: &[u8]) -> Result<u128, ParseError> {
-    std::str::from_utf8(b)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(ParseError::NotInt)
+fn invalid_expire_time(name: &str) -> ParseError {
+    ParseError::InvalidExpireTime(name.to_ascii_lowercase())
 }
 
-fn parse_i128(b: &[u8]) -> Result<i128, ParseError> {
-    std::str::from_utf8(b)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(ParseError::NotInt)
+fn set_relative_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {
+    if n <= 0 {
+        return Err(invalid_expire_time(name));
+    }
+    relative_deadline(n, ms, name)
+}
+
+fn expire_relative_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {
+    if n <= 0 {
+        return Ok(0);
+    }
+    relative_deadline(n, ms, name)
+}
+
+fn relative_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {
+    let delta = duration_millis(n, ms, name)?;
+    now_millis()
+        .checked_add(delta)
+        .filter(|deadline| *deadline <= MAX_EXPIRE_AT_MS)
+        .ok_or_else(|| invalid_expire_time(name))
+}
+
+fn set_absolute_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {
+    if n <= 0 {
+        return Err(invalid_expire_time(name));
+    }
+    absolute_deadline(n, ms, name)
+}
+
+fn expire_absolute_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {
+    if n <= 0 {
+        return Ok(0);
+    }
+    absolute_deadline(n, ms, name)
+}
+
+fn absolute_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {
+    duration_millis(n, ms, name).and_then(|deadline| {
+        if deadline <= MAX_EXPIRE_AT_MS {
+            Ok(deadline)
+        } else {
+            Err(invalid_expire_time(name))
+        }
+    })
+}
+
+fn duration_millis(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {
+    if ms {
+        Ok(n as ExpireAt)
+    } else {
+        (n as ExpireAt)
+            .checked_mul(MILLIS_PER_SECOND)
+            .ok_or_else(|| invalid_expire_time(name))
+    }
 }
 
 fn expect_bulk(frame: Frame, idx: usize) -> Result<Bytes, ParseError> {
