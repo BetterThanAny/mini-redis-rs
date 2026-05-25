@@ -77,7 +77,7 @@ fn parse_array(c: &mut std::io::Cursor<&[u8]>, depth: usize) -> Result<Frame, Er
             "array length {count} exceeds limit {MAX_ARRAY_LEN}"
         )));
     }
-    let mut items = Vec::with_capacity(count);
+    let mut items = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         items.push(parse_frame(c, depth + 1)?);
     }

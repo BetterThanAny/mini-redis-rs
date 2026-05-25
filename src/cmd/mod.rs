@@ -124,8 +124,7 @@ impl Command {
                     Frame::Bulk(value.clone()),
                 ];
                 if let Some(deadline) = expires_at {
-                    parts.push(bulk(b"PXAT"));
-                    parts.push(bulk_string(deadline));
+                    push_set_expiry(&mut parts, *deadline);
                 }
                 Some(Frame::Array(parts))
             }
@@ -711,6 +710,22 @@ fn command_with_values(name: &'static [u8], key: &Bytes, values: &[Bytes]) -> Fr
     Frame::Array(parts)
 }
 
+fn push_set_expiry(parts: &mut Vec<Frame>, deadline: ExpireAt) {
+    if deadline <= MAX_EXPIRE_AT_MS {
+        parts.push(bulk(b"PXAT"));
+        parts.push(bulk_string(deadline));
+    } else {
+        parts.push(bulk(b"PX"));
+        parts.push(bulk_string(relative_millis_for_aof(deadline)));
+    }
+}
+
+fn relative_millis_for_aof(deadline: ExpireAt) -> ExpireAt {
+    deadline
+        .saturating_sub(now_millis())
+        .clamp(1, MAX_EXPIRE_AT_MS)
+}
+
 fn pexpireat_frame(key: &Bytes, deadline: ExpireAt) -> Frame {
     Frame::Array(vec![
         bulk(b"PEXPIREAT"),
@@ -742,7 +757,13 @@ fn set_relative_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, Parse
     if n <= 0 {
         return Err(invalid_expire_time(name));
     }
-    relative_deadline(n, ms, name)
+    let delta = duration_millis(n, ms, name)?;
+    if delta > MAX_EXPIRE_AT_MS {
+        return Err(invalid_expire_time(name));
+    }
+    now_millis()
+        .checked_add(delta)
+        .ok_or_else(|| invalid_expire_time(name))
 }
 
 fn expire_relative_deadline(n: i64, ms: bool, name: &str) -> Result<ExpireAt, ParseError> {

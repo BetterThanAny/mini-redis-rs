@@ -208,6 +208,36 @@ async fn aof_replay_preserves_absolute_ttl_across_restart() {
 }
 
 #[tokio::test]
+async fn aof_replays_redis_max_relative_set_ttl() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("huge-relative-ttl.aof");
+
+    {
+        let (addr, shutdown) = spawn_with_aof(path.clone()).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        send(
+            &mut s,
+            &array(&[b"SET", b"huge-ttl", b"v", b"PX", b"9223372036854775807"]),
+        )
+        .await;
+        assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
+        let _ = shutdown.send(());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    {
+        let (addr, _shutdown) = spawn_with_aof(path.clone()).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        send(&mut s, &array(&[b"PTTL", b"huge-ttl"])).await;
+        let pttl = read_integer(&mut s).await;
+        assert!(
+            (9223372036854774000..=9223372036854775807).contains(&pttl),
+            "PTTL should replay Redis's max relative SET TTL, got {pttl}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn bgrewriteaof_compacts_file_and_replays_new_state() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("rewrite.aof");

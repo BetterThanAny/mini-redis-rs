@@ -156,6 +156,13 @@ fn array_length_above_cap_errors() {
 }
 
 #[test]
+fn max_length_incomplete_array_does_not_error() {
+    let mut buf = BytesMut::from(&b"*1048576\r\n"[..]);
+    assert!(parser::parse(&mut buf).unwrap().is_none());
+    assert_eq!(&buf[..], b"*1048576\r\n");
+}
+
+#[test]
 fn bulk_length_above_cap_errors() {
     let mut buf = BytesMut::from(&b"$9999999999\r\n"[..]);
     let err = parser::parse(&mut buf);

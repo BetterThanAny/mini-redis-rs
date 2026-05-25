@@ -9,6 +9,7 @@ use xxhash_rust::xxh64::xxh64;
 
 const SHARDS: usize = 16;
 const PUBSUB_CHAN_CAP: usize = 1024;
+const MAX_EXPIRE_AT_MS: ExpireAt = i64::MAX as ExpireAt;
 
 pub type ExpireAt = u128;
 
@@ -214,8 +215,7 @@ impl Db {
                         crate::resp::Frame::Bulk(value),
                     ];
                     if let Some(deadline) = entry.expires_at {
-                        parts.push(bulk_static(b"PXAT"));
-                        parts.push(bulk_string(deadline));
+                        push_set_expiry(&mut parts, deadline);
                     }
                     frames.push(crate::resp::Frame::Array(parts));
                 }
@@ -307,6 +307,22 @@ fn bulk_static(bytes: &'static [u8]) -> crate::resp::Frame {
 
 fn bulk_string(value: impl ToString) -> crate::resp::Frame {
     crate::resp::Frame::Bulk(Bytes::from(value.to_string()))
+}
+
+fn push_set_expiry(parts: &mut Vec<crate::resp::Frame>, deadline: ExpireAt) {
+    if deadline <= MAX_EXPIRE_AT_MS {
+        parts.push(bulk_static(b"PXAT"));
+        parts.push(bulk_string(deadline));
+    } else {
+        parts.push(bulk_static(b"PX"));
+        parts.push(bulk_string(relative_millis_for_aof(deadline)));
+    }
+}
+
+fn relative_millis_for_aof(deadline: ExpireAt) -> ExpireAt {
+    deadline
+        .saturating_sub(now_millis())
+        .clamp(1, MAX_EXPIRE_AT_MS)
 }
 
 fn pexpireat_frame(key: Bytes, deadline: ExpireAt) -> crate::resp::Frame {

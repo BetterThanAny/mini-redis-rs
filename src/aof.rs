@@ -12,6 +12,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 const MAX_REWRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AOF_BUFFERED_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXPIRE_AT_MS: ExpireAt = i64::MAX as ExpireAt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
@@ -272,7 +274,18 @@ pub async fn replay(path: &Path, db: &Db) -> anyhow::Result<u64> {
             // Tolerate corruption in the tail: warn and stop, do NOT propagate the error
             // (otherwise the server can never restart on a partially-trashed AOF).
             match parser::parse(&mut buf) {
-                Ok(None) => break,
+                Ok(None) => {
+                    if buf.len() > MAX_AOF_BUFFERED_FRAME_BYTES {
+                        tracing::warn!(
+                            offset = frame_start,
+                            buffered = buf.len(),
+                            limit = MAX_AOF_BUFFERED_FRAME_BYTES,
+                            "AOF frame exceeds buffered replay limit; truncating to valid prefix"
+                        );
+                        truncate_to = Some(valid_len);
+                    }
+                    break;
+                }
                 Ok(Some(frame)) => match Command::from_frame(frame) {
                     Ok(cmd) => {
                         let resp = cmd.apply(db);
@@ -428,8 +441,7 @@ fn snapshot_frames_for_entry((key, entry): (Bytes, Entry)) -> Vec<Frame> {
         Value::String(value) => {
             let mut parts = vec![bulk_static(b"SET"), Frame::Bulk(key), Frame::Bulk(value)];
             if let Some(deadline) = entry.expires_at {
-                parts.push(bulk_static(b"PXAT"));
-                parts.push(bulk_string(deadline));
+                push_set_expiry(&mut parts, deadline);
             }
             vec![Frame::Array(parts)]
         }
@@ -470,6 +482,22 @@ fn bulk_static(bytes: &'static [u8]) -> Frame {
 
 fn bulk_string(value: impl ToString) -> Frame {
     Frame::Bulk(Bytes::from(value.to_string()))
+}
+
+fn push_set_expiry(parts: &mut Vec<Frame>, deadline: ExpireAt) {
+    if deadline <= MAX_EXPIRE_AT_MS {
+        parts.push(bulk_static(b"PXAT"));
+        parts.push(bulk_string(deadline));
+    } else {
+        parts.push(bulk_static(b"PX"));
+        parts.push(bulk_string(relative_millis_for_aof(deadline)));
+    }
+}
+
+fn relative_millis_for_aof(deadline: ExpireAt) -> ExpireAt {
+    deadline
+        .saturating_sub(crate::db::now_millis())
+        .clamp(1, MAX_EXPIRE_AT_MS)
 }
 
 fn pexpireat_frame(key: Bytes, deadline: ExpireAt) -> Frame {
@@ -644,15 +672,11 @@ async fn finish_rewrite_file(
         temp.write_all(bytes).await?;
     }
     temp.sync_data().await?;
-    drop(temp);
 
+    let replacement = temp;
     fs::rename(temp_path, path).await?;
     let parent_sync = sync_parent_dir(path).await;
-    *active_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
+    *active_file = replacement;
     if policy == FsyncPolicy::Always {
         active_file.sync_data().await?;
     }

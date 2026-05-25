@@ -162,6 +162,40 @@ async fn pttl_returns_milliseconds() {
 }
 
 #[tokio::test]
+async fn set_accepts_redis_max_relative_ttl() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+
+    send(
+        &mut s,
+        &array(&[b"SET", b"px-max", b"v", b"PX", b"9223372036854775807"]),
+    )
+    .await;
+    assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
+    send(&mut s, &array(&[b"PTTL", b"px-max"])).await;
+    let resp = read_some(&mut s).await;
+    let pttl = parse_integer_frame(&resp);
+    assert!(
+        (9223372036854774000..=9223372036854775807).contains(&pttl),
+        "PTTL should preserve Redis's max PX TTL, got {pttl}"
+    );
+
+    send(
+        &mut s,
+        &array(&[b"SET", b"ex-max", b"v", b"EX", b"9223372036854775"]),
+    )
+    .await;
+    assert_eq!(read_n(&mut s, 5).await, b"+OK\r\n");
+    send(&mut s, &array(&[b"PTTL", b"ex-max"])).await;
+    let resp = read_some(&mut s).await;
+    let pttl = parse_integer_frame(&resp);
+    assert!(
+        (9223372036854773000..=9223372036854775000).contains(&pttl),
+        "PTTL should preserve Redis's max EX TTL, got {pttl}"
+    );
+}
+
+#[tokio::test]
 async fn key_expires_after_ttl() {
     let (addr, _g) = spawn_server().await;
     let mut s = TcpStream::connect(addr).await.unwrap();
@@ -174,6 +208,12 @@ async fn key_expires_after_ttl() {
 
     send(&mut s, &array(&[b"GET", b"k"])).await;
     assert_eq!(read_n(&mut s, 5).await, b"$-1\r\n");
+}
+
+fn parse_integer_frame(resp: &[u8]) -> i64 {
+    let s = std::str::from_utf8(resp).unwrap();
+    assert!(s.starts_with(':'), "expected integer frame, got {s:?}");
+    s[1..s.len() - 2].parse().unwrap()
 }
 
 #[tokio::test]

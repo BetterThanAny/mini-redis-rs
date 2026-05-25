@@ -79,7 +79,9 @@ redis-cli -p 6380 INFO persistence
 
 Rewrite behavior:
 
-- The server keeps accepting reads and writes while rewrite runs.
+- The server keeps accepting connections while rewrite runs. Commands pause
+  briefly while the rewrite task captures a consistent in-memory snapshot, then
+  resume while the temporary AOF is written and switched into place.
 - Rewrite creates a compact temporary AOF from a consistent DB snapshot.
 - Writes that happen during rewrite are buffered and appended to the temporary
   AOF before the final switch.
@@ -87,14 +89,17 @@ Rewrite behavior:
   fsyncs the parent directory.
 - If rewrite fails before the final replacement, the old AOF remains active and
   replayable. After `rename` succeeds, the compacted AOF is the active file even
-  if a later directory fsync/open step reports an operational error.
+  if a later directory or data sync step reports an operational error.
 
 ## TTL Semantics
 
 TTL is enforced with both lazy expiration on access and an active sweeper running
-every 100ms. AOF entries store absolute expiration times with `PXAT` /
+every 100ms. AOF entries normally store absolute expiration times with `PXAT` /
 `PEXPIREAT`, so TTL keeps decaying across process restarts instead of being reset
-from the original relative duration.
+from the original relative duration. Extremely large Redis-compatible `SET PX`
+or `SET EX` TTLs whose absolute deadline is beyond signed-millisecond range are
+persisted with relative `PX` because Redis does not accept such values as
+absolute `PXAT` timestamps.
 
 Supported expiration commands include `EXPIRE`, `PEXPIRE`, `EXPIREAT`,
 `PEXPIREAT`, `TTL`, `PTTL`, and `PERSIST`. `SET` supports `EX`, `PX`, `EXAT`,
@@ -103,9 +108,11 @@ and `PXAT`.
 ## Supported Commands
 
 - **Strings:** `GET`, `SET`, `DEL`, `EXISTS`, `INCR`, `DECR`, `INCRBY`,
-  `DECRBY`, `APPEND`, `STRLEN`, `MGET`, `MSET`
+  `DECRBY`, `APPEND`, `STRLEN`, `MGET`, `MSET` (`SET` condition/result options
+  such as `NX`, `XX`, `GET`, and `KEEPTTL` are intentionally out of scope.)
 - **TTL:** `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`,
-  `PERSIST`
+  `PERSIST` (Redis 7/8 conditional expire modifiers such as `NX`, `XX`, `GT`,
+  and `LT` are intentionally out of scope.)
 - **Lists:** `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`, `LINDEX`
 - **Hashes:** `HSET`, `HGET`, `HDEL`, `HKEYS`, `HVALS`, `HGETALL`, `HEXISTS`,
   `HLEN`, `HINCRBY`
