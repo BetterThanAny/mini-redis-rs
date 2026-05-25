@@ -3,11 +3,11 @@
 > Snapshot for the next session. Read this **before** PLAN.md — PLAN.md is the
 > original design (preserved for context); STATUS.md is what's actually true now.
 
-**Last updated:** 2026-04-27
-**Branch:** `main` · 15 commits · clean working tree
-**Tests:** 89/89 passing (3× consecutive clean runs, no flakiness)
+**Last updated:** 2026-05-25
+**Branch:** `main` · 25 commits · clean working tree
+**Tests:** 118/118 passing
 **Lint:** `cargo clippy --all-targets -- -D warnings` clean
-**LoC:** src 1,604 · tests 1,215 · total ≈ 2,820
+**LoC:** src 3,384 · tests 2,043 · total ≈ 5,430
 
 ---
 

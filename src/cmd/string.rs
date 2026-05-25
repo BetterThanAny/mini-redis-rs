@@ -1,4 +1,5 @@
 use crate::db::{entry_expired, now_millis, Db, Entry, ExpireAt, Value};
+use crate::limits;
 use crate::resp::Frame;
 use bytes::Bytes;
 use std::time::Duration;
@@ -129,19 +130,41 @@ pub fn strlen(db: &Db, key: &Bytes) -> Frame {
 }
 
 pub fn mget(db: &Db, keys: &[Bytes]) -> Frame {
-    let frames = keys
-        .iter()
-        .map(|k| {
+    let Some(mut response_len) = limits::resp_array_header_len(keys.len()) else {
+        return limits::response_too_large();
+    };
+    let mut frames = Vec::with_capacity(keys.len());
+    for k in keys {
+        let frame = {
             let shard = db.shard_for(k).lock().unwrap();
             match shard.entries.get(k) {
                 Some(e) if !entry_expired(e) => match &e.value {
-                    Value::String(b) => Frame::Bulk(b.clone()),
-                    _ => Frame::Null,
+                    Value::String(b) => {
+                        let Some(bulk_len) = limits::resp_bulk_len(b.len()) else {
+                            return limits::response_too_large();
+                        };
+                        if !limits::checked_add_response_len(&mut response_len, bulk_len) {
+                            return limits::response_too_large();
+                        }
+                        Frame::Bulk(b.clone())
+                    }
+                    _ => {
+                        if !limits::checked_add_response_len(&mut response_len, 5) {
+                            return limits::response_too_large();
+                        }
+                        Frame::Null
+                    }
                 },
-                _ => Frame::Null,
+                _ => {
+                    if !limits::checked_add_response_len(&mut response_len, 5) {
+                        return limits::response_too_large();
+                    }
+                    Frame::Null
+                }
             }
-        })
-        .collect();
+        };
+        frames.push(frame);
+    }
     Frame::Array(frames)
 }
 

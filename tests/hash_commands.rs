@@ -1,3 +1,5 @@
+use bytes::Bytes;
+use mini_redis_rs::{cmd::hash, db::Db, resp::Frame};
 use std::collections::HashSet;
 use tokio::net::TcpStream;
 
@@ -84,6 +86,22 @@ async fn hgetall_returns_pairs() {
     let resp_str = String::from_utf8_lossy(&resp).to_string();
     assert!(resp_str.contains("a") && resp_str.contains("1"));
     assert!(resp_str.contains("b") && resp_str.contains("2"));
+}
+
+#[test]
+fn large_hgetall_response_is_rejected_before_cloning_all_fields() {
+    let db = Db::new();
+    let key = Bytes::from_static(b"huge-hash");
+    let value = Bytes::from(vec![b'x'; 1024 * 1024]);
+    let pairs = (0..65)
+        .map(|idx| (Bytes::from(format!("field:{idx}")), value.clone()))
+        .collect();
+    assert_eq!(hash::hset(&db, key.clone(), pairs), Frame::Integer(65));
+
+    match hash::hgetall(&db, &key) {
+        Frame::Error(err) => assert!(err.contains("response exceeds output limit")),
+        other => panic!("expected response limit error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

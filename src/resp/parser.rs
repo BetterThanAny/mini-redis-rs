@@ -1,8 +1,9 @@
 use super::{Error, Frame};
 use bytes::{Buf, Bytes, BytesMut};
 
-/// Mirrors Redis's `proto-max-bulk-len` default (512 MB).
-const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+/// Bound bulk frames to the per-connection buffer budget so an oversized
+/// declaration is rejected from the header instead of after reading tens of MB.
+const MAX_BULK_LEN: usize = crate::limits::MAX_BULK_LEN;
 /// Sensible cap on array length (1M elements) — without this a malicious
 /// `*999999999\r\n` would `Vec::with_capacity` ~tens of GB.
 const MAX_ARRAY_LEN: usize = 1024 * 1024;

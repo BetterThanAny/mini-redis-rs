@@ -144,7 +144,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The integration suite currently has 109 tests covering RESP2 parsing, strings,
+The integration suite currently has 118 tests covering RESP2 parsing, strings,
 lists, hashes, pub/sub, TTL, AOF replay, AOF rewrite, `INFO`, and wire-level
 response shapes for `redis-cli` workflows. GitHub Actions runs fmt, clippy, and
 tests on push and pull request.

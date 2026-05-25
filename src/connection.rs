@@ -5,7 +5,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-const MAX_BUFFERED_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -29,9 +28,10 @@ impl Connection {
             if let Some(frame) = parser::parse(&mut self.buf)? {
                 return Ok(Some(frame));
             }
-            if self.buf.len() > MAX_BUFFERED_FRAME_BYTES {
+            if self.buf.len() > crate::limits::MAX_BUFFERED_FRAME_BYTES {
                 anyhow::bail!(
-                    "client frame exceeds buffered limit of {MAX_BUFFERED_FRAME_BYTES} bytes"
+                    "client frame exceeds buffered limit of {} bytes",
+                    crate::limits::MAX_BUFFERED_FRAME_BYTES
                 );
             }
             let n = timeout(READ_IDLE_TIMEOUT, self.stream.read_buf(&mut self.buf))
@@ -47,6 +47,14 @@ impl Connection {
     }
 
     pub async fn write_frame(&mut self, frame: &Frame) -> anyhow::Result<()> {
+        let encoded_len = encoder::encoded_len(frame)
+            .ok_or_else(|| anyhow::anyhow!("server response length overflow"))?;
+        if encoded_len > crate::limits::MAX_RESPONSE_FRAME_BYTES {
+            anyhow::bail!(
+                "server response exceeds output limit of {} bytes",
+                crate::limits::MAX_RESPONSE_FRAME_BYTES
+            );
+        }
         self.out.clear();
         encoder::encode(frame, &mut self.out);
         timeout(WRITE_TIMEOUT, self.stream.write_all(&self.out))

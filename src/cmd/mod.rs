@@ -287,6 +287,8 @@ pub enum ParseError {
     NotInt,
     #[error("invalid expire time in '{0}' command")]
     InvalidExpireTime(String),
+    #[error("value is out of range, must be positive")]
+    OutOfRangePositive,
     #[error("syntax error")]
     Syntax,
 }
@@ -675,7 +677,7 @@ fn parse_pop(rest: Vec<Bytes>, name: &str) -> Result<(Bytes, Option<usize>), Par
             let key = it.next().unwrap();
             let count = parse_i64(&it.next().unwrap())?;
             if count < 0 {
-                return Err(ParseError::Syntax);
+                return Err(ParseError::OutOfRangePositive);
             }
             Ok((key, Some(count as usize)))
         }

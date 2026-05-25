@@ -1,5 +1,24 @@
 use super::Frame;
+use crate::limits;
 use bytes::{BufMut, BytesMut};
+
+pub fn encoded_len(frame: &Frame) -> Option<usize> {
+    match frame {
+        Frame::Simple(s) | Frame::Error(s) => 1usize.checked_add(s.len())?.checked_add(2),
+        Frame::Integer(n) => 1usize
+            .checked_add(limits::decimal_len_i64(*n))?
+            .checked_add(2),
+        Frame::Bulk(b) => limits::resp_bulk_len(b.len()),
+        Frame::Null | Frame::NullArray => Some(5),
+        Frame::Array(items) => {
+            let mut len = limits::resp_array_header_len(items.len())?;
+            for item in items {
+                len = len.checked_add(encoded_len(item)?)?;
+            }
+            Some(len)
+        }
+    }
+}
 
 pub fn encode(frame: &Frame, out: &mut BytesMut) {
     match frame {

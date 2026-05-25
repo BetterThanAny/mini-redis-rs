@@ -1,3 +1,5 @@
+use bytes::Bytes;
+use mini_redis_rs::{cmd::string, db::Db, resp::Frame};
 use tokio::net::TcpStream;
 
 mod common;
@@ -122,6 +124,26 @@ async fn mset_mget() {
     send(&mut s, &array(&[b"MGET", b"a", b"missing", b"b"])).await;
     let resp = read_some(&mut s).await;
     assert_eq!(resp, b"*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n2\r\n");
+}
+
+#[test]
+fn large_mget_response_is_rejected_before_cloning_all_values() {
+    let db = Db::new();
+    let value = Bytes::from(vec![b'x'; 1024 * 1024]);
+    let keys: Vec<Bytes> = (0..65)
+        .map(|idx| Bytes::from(format!("huge-mget:{idx}")))
+        .collect();
+    for key in &keys {
+        assert_eq!(
+            string::set_at(&db, key.clone(), value.clone(), None),
+            Frame::Simple("OK".into())
+        );
+    }
+
+    match string::mget(&db, &keys) {
+        Frame::Error(err) => assert!(err.contains("response exceeds output limit")),
+        other => panic!("expected response limit error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

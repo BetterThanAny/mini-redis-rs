@@ -1,4 +1,5 @@
 use crate::db::{entry_expired, Db, Entry, Value};
+use crate::limits;
 use crate::resp::Frame;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -80,7 +81,7 @@ pub fn hkeys(db: &Db, key: &Bytes) -> Frame {
         _ => return Frame::Array(vec![]),
     };
     match &entry.value {
-        Value::Hash(m) => Frame::Array(m.keys().cloned().map(Frame::Bulk).collect()),
+        Value::Hash(m) => bulk_array_from_iter(m.len(), m.keys()),
         _ => Frame::Error(WRONGTYPE.into()),
     }
 }
@@ -92,7 +93,7 @@ pub fn hvals(db: &Db, key: &Bytes) -> Frame {
         _ => return Frame::Array(vec![]),
     };
     match &entry.value {
-        Value::Hash(m) => Frame::Array(m.values().cloned().map(Frame::Bulk).collect()),
+        Value::Hash(m) => bulk_array_from_iter(m.len(), m.values()),
         _ => Frame::Error(WRONGTYPE.into()),
     }
 }
@@ -105,8 +106,22 @@ pub fn hgetall(db: &Db, key: &Bytes) -> Frame {
     };
     match &entry.value {
         Value::Hash(m) => {
-            let mut out = Vec::with_capacity(m.len() * 2);
+            let Some(item_count) = m.len().checked_mul(2) else {
+                return limits::response_too_large();
+            };
+            let Some(mut response_len) = limits::resp_array_header_len(item_count) else {
+                return limits::response_too_large();
+            };
+            let mut out = Vec::with_capacity(item_count);
             for (k, v) in m {
+                for item in [k, v] {
+                    let Some(bulk_len) = limits::resp_bulk_len(item.len()) else {
+                        return limits::response_too_large();
+                    };
+                    if !limits::checked_add_response_len(&mut response_len, bulk_len) {
+                        return limits::response_too_large();
+                    }
+                }
                 out.push(Frame::Bulk(k.clone()));
                 out.push(Frame::Bulk(v.clone()));
             }
@@ -114,6 +129,23 @@ pub fn hgetall(db: &Db, key: &Bytes) -> Frame {
         }
         _ => Frame::Error(WRONGTYPE.into()),
     }
+}
+
+fn bulk_array_from_iter<'a>(len: usize, values: impl Iterator<Item = &'a Bytes>) -> Frame {
+    let Some(mut response_len) = limits::resp_array_header_len(len) else {
+        return limits::response_too_large();
+    };
+    let mut out = Vec::with_capacity(len);
+    for value in values {
+        let Some(bulk_len) = limits::resp_bulk_len(value.len()) else {
+            return limits::response_too_large();
+        };
+        if !limits::checked_add_response_len(&mut response_len, bulk_len) {
+            return limits::response_too_large();
+        }
+        out.push(Frame::Bulk(value.clone()));
+    }
+    Frame::Array(out)
 }
 
 pub fn hexists(db: &Db, key: &Bytes, field: &Bytes) -> Frame {

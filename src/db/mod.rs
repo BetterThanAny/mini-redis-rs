@@ -190,7 +190,7 @@ impl Db {
         }
     }
 
-    pub fn aof_snapshot_frames(&self) -> Vec<crate::resp::Frame> {
+    pub fn aof_snapshot_entries(&self) -> Vec<(Bytes, Entry)> {
         let now = now_millis();
         let mut entries: Vec<(Bytes, Entry)> = Vec::new();
         for shard_mu in self.iter_shards() {
@@ -204,7 +204,11 @@ impl Db {
             );
         }
         entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+        entries
+    }
 
+    pub fn aof_snapshot_frames(&self) -> Vec<crate::resp::Frame> {
+        let entries = self.aof_snapshot_entries();
         let mut frames = Vec::with_capacity(entries.len() * 2);
         for (key, entry) in entries {
             match entry.value {

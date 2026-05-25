@@ -1,4 +1,5 @@
 use crate::db::{entry_expired, Db, Entry, Value};
+use crate::limits;
 use crate::resp::Frame;
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -75,6 +76,9 @@ fn pop(db: &Db, key: &Bytes, count: Option<usize>, side: PopSide) -> Frame {
             Some(_) => Frame::Array(vec![]),
         };
     }
+    if count.is_some() && pop_array_response_too_large(list, n, &side) {
+        return limits::response_too_large();
+    }
     let mut popped = Vec::with_capacity(n);
     for _ in 0..n {
         let v = match side {
@@ -93,6 +97,25 @@ fn pop(db: &Db, key: &Bytes, count: Option<usize>, side: PopSide) -> Frame {
         None => Frame::Bulk(popped.into_iter().next().unwrap()),
         Some(_) => Frame::Array(popped.into_iter().map(Frame::Bulk).collect()),
     }
+}
+
+fn pop_array_response_too_large(list: &VecDeque<Bytes>, n: usize, side: &PopSide) -> bool {
+    let Some(mut response_len) = limits::resp_array_header_len(n) else {
+        return true;
+    };
+    let values: Box<dyn Iterator<Item = &Bytes> + '_> = match side {
+        PopSide::Left => Box::new(list.iter().take(n)),
+        PopSide::Right => Box::new(list.iter().rev().take(n)),
+    };
+    for value in values {
+        let Some(bulk_len) = limits::resp_bulk_len(value.len()) else {
+            return true;
+        };
+        if !limits::checked_add_response_len(&mut response_len, bulk_len) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn lpop(db: &Db, key: &Bytes, count: Option<usize>) -> Frame {
@@ -148,12 +171,20 @@ pub fn lrange(db: &Db, key: &Bytes, start: i64, stop: i64) -> Frame {
     if start_idx > stop_idx {
         return Frame::Array(vec![]);
     }
-    let frames: Vec<Frame> = list
-        .iter()
-        .skip(start_idx)
-        .take(stop_idx - start_idx + 1)
-        .map(|b| Frame::Bulk(b.clone()))
-        .collect();
+    let count = stop_idx - start_idx + 1;
+    let Some(mut response_len) = limits::resp_array_header_len(count) else {
+        return limits::response_too_large();
+    };
+    let mut frames = Vec::with_capacity(count);
+    for b in list.iter().skip(start_idx).take(count) {
+        let Some(bulk_len) = limits::resp_bulk_len(b.len()) else {
+            return limits::response_too_large();
+        };
+        if !limits::checked_add_response_len(&mut response_len, bulk_len) {
+            return limits::response_too_large();
+        }
+        frames.push(Frame::Bulk(b.clone()));
+    }
     Frame::Array(frames)
 }
 

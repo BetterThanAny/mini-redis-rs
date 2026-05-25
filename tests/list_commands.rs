@@ -1,3 +1,5 @@
+use bytes::Bytes;
+use mini_redis_rs::{cmd::list, db::Db, resp::Frame};
 use tokio::net::TcpStream;
 
 mod common;
@@ -168,6 +170,49 @@ async fn lpop_with_count_zero_returns_empty_array() {
     let _ = read_n(&mut s, 4).await;
     send(&mut s, &array(&[b"LPOP", b"l", b"0"])).await;
     assert_eq!(read_n(&mut s, 4).await, b"*0\r\n");
+}
+
+#[tokio::test]
+async fn pop_negative_count_matches_redis_error() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    send(&mut s, &array(&[b"RPUSH", b"l", b"a"])).await;
+    let _ = read_n(&mut s, 4).await;
+
+    send(&mut s, &array(&[b"LPOP", b"l", b"-1"])).await;
+    let resp = read_some(&mut s).await;
+    assert_eq!(resp, b"-ERR value is out of range, must be positive\r\n");
+}
+
+#[test]
+fn large_lrange_response_is_rejected_before_cloning_all_values() {
+    let db = Db::new();
+    let value = Bytes::from(vec![b'x'; 1024 * 1024]);
+    let values = (0..65).map(|_| value.clone()).collect();
+    assert_eq!(
+        list::rpush(&db, Bytes::from_static(b"huge-list"), values),
+        Frame::Integer(65)
+    );
+
+    match list::lrange(&db, &Bytes::from_static(b"huge-list"), 0, -1) {
+        Frame::Error(err) => assert!(err.contains("response exceeds output limit")),
+        other => panic!("expected response limit error, got {other:?}"),
+    }
+}
+
+#[test]
+fn oversized_lpop_count_does_not_mutate_list() {
+    let db = Db::new();
+    let key = Bytes::from_static(b"huge-pop-list");
+    let value = Bytes::from(vec![b'x'; 1024 * 1024]);
+    let values = (0..65).map(|_| value.clone()).collect();
+    assert_eq!(list::rpush(&db, key.clone(), values), Frame::Integer(65));
+
+    match list::lpop(&db, &key, Some(65)) {
+        Frame::Error(err) => assert!(err.contains("response exceeds output limit")),
+        other => panic!("expected response limit error, got {other:?}"),
+    }
+    assert_eq!(list::llen(&db, &key), Frame::Integer(65));
 }
 
 #[tokio::test]

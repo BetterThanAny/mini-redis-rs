@@ -382,12 +382,15 @@ pub async fn spawn_writer(path: PathBuf, policy: FsyncPolicy) -> anyhow::Result<
 
 async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
     let temp_path = rewrite_temp_path(&handle.path);
-    let write_pause = db.pause_writes().await;
-    handle.start_rewrite_buffering().await?;
-    let write_result = write_snapshot_from_db(&temp_path, &db).await;
-    drop(write_pause);
+    let entries = {
+        let write_pause = db.pause_writes().await;
+        handle.start_rewrite_buffering().await?;
+        let entries = db.aof_snapshot_entries();
+        drop(write_pause);
+        entries
+    };
 
-    if let Err(err) = write_result {
+    if let Err(err) = write_snapshot_entries(&temp_path, entries).await {
         handle.abort_rewrite(err.to_string()).await;
         let _ = fs::remove_file(&temp_path).await;
         return Err(err);
@@ -401,7 +404,7 @@ async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn write_snapshot_from_db(path: &Path, db: &Db) -> anyhow::Result<()> {
+async fn write_snapshot_entries(path: &Path, entries: Vec<(Bytes, Entry)>) -> anyhow::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -409,24 +412,8 @@ async fn write_snapshot_from_db(path: &Path, db: &Db) -> anyhow::Result<()> {
         .open(path)
         .await?;
     let mut buf = BytesMut::new();
-    let now = crate::db::now_millis();
-    for shard_mu in db.iter_shards() {
-        let frames = {
-            let shard = shard_mu.lock().unwrap();
-            let mut entries: Vec<(Bytes, Entry)> = shard
-                .entries
-                .iter()
-                .filter(|(_, entry)| !entry.expires_at.is_some_and(|deadline| deadline <= now))
-                .map(|(key, entry)| (key.clone(), entry.clone()))
-                .collect();
-            entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
-            entries
-                .into_iter()
-                .flat_map(snapshot_frames_for_entry)
-                .collect::<Vec<_>>()
-        };
-
-        for frame in frames {
+    for entry in entries {
+        for frame in snapshot_frames_for_entry(entry) {
             buf.clear();
             encoder::encode(&frame, &mut buf);
             file.write_all(&buf).await?;
