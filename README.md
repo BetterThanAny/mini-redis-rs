@@ -79,10 +79,11 @@ redis-cli -p 6380 INFO persistence
 
 Rewrite behavior:
 
-- The server keeps accepting connections while rewrite runs. Commands pause
-  briefly while the rewrite task captures a consistent in-memory snapshot, then
-  resume while the temporary AOF is written and switched into place.
-- Rewrite creates a compact temporary AOF from a consistent DB snapshot.
+- The server keeps accepting connections while rewrite runs. Commands may wait
+  while the rewrite task serializes a consistent snapshot shard-by-shard, then
+  resume while the temporary AOF is switched into place.
+- Rewrite creates a compact temporary AOF from a consistent DB snapshot, chunking
+  generated commands so the rewritten AOF stays within replay frame limits.
 - Writes that happen during rewrite are buffered and appended to the temporary
   AOF before the final switch.
 - The final replacement uses atomic `rename` on the same filesystem and then
@@ -90,6 +91,8 @@ Rewrite behavior:
 - If rewrite fails before the final replacement, the old AOF remains active and
   replayable. After `rename` succeeds, the compacted AOF is the active file even
   if a later directory or data sync step reports an operational error.
+- In this implementation `BGREWRITEAOF` requires `--aof`; without an AOF path it
+  returns `ERR AOF is not enabled`.
 
 ## TTL Semantics
 
@@ -144,7 +147,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The integration suite currently has 118 tests covering RESP2 parsing, strings,
+The integration suite currently has 121 tests covering RESP2 parsing, strings,
 lists, hashes, pub/sub, TTL, AOF replay, AOF rewrite, `INFO`, and wire-level
 response shapes for `redis-cli` workflows. GitHub Actions runs fmt, clippy, and
 tests on push and pull request.

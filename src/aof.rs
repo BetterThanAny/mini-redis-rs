@@ -1,5 +1,6 @@
 use crate::cmd::Command;
-use crate::db::{Db, Entry, ExpireAt, Value};
+use crate::db::{entry_expired, Db, Entry, ExpireAt, Value};
+use crate::limits;
 use crate::resp::{encoder, parser, Frame};
 use bytes::{Bytes, BytesMut};
 use std::path::{Path, PathBuf};
@@ -382,19 +383,20 @@ pub async fn spawn_writer(path: PathBuf, policy: FsyncPolicy) -> anyhow::Result<
 
 async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
     let temp_path = rewrite_temp_path(&handle.path);
-    let entries = {
-        let write_pause = db.pause_writes().await;
-        handle.start_rewrite_buffering().await?;
-        let entries = db.aof_snapshot_entries();
-        drop(write_pause);
-        entries
-    };
 
-    if let Err(err) = write_snapshot_entries(&temp_path, entries).await {
+    let write_pause = db.pause_writes().await;
+    if let Err(err) = handle.start_rewrite_buffering().await {
+        drop(write_pause);
+        return Err(err);
+    }
+
+    if let Err(err) = write_snapshot_from_db(&temp_path, &db).await {
+        drop(write_pause);
         handle.abort_rewrite(err.to_string()).await;
         let _ = fs::remove_file(&temp_path).await;
         return Err(err);
     }
+    drop(write_pause);
 
     if let Err(err) = handle.finish_rewrite(temp_path.clone()).await {
         let _ = fs::remove_file(&temp_path).await;
@@ -404,7 +406,7 @@ async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn write_snapshot_entries(path: &Path, entries: Vec<(Bytes, Entry)>) -> anyhow::Result<()> {
+async fn write_snapshot_from_db(path: &Path, db: &Db) -> anyhow::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -412,55 +414,282 @@ async fn write_snapshot_entries(path: &Path, entries: Vec<(Bytes, Entry)>) -> an
         .open(path)
         .await?;
     let mut buf = BytesMut::new();
-    for entry in entries {
-        for frame in snapshot_frames_for_entry(entry) {
-            buf.clear();
-            encoder::encode(&frame, &mut buf);
-            file.write_all(&buf).await?;
+    for shard_mu in db.iter_shards() {
+        let mut entries: Vec<(Bytes, Entry)> = {
+            let shard = shard_mu.lock().unwrap();
+            shard
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry_expired(entry))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect()
+        };
+        entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+        for (key, entry) in entries {
+            write_snapshot_entry(&mut file, &mut buf, key, entry).await?;
         }
     }
     file.sync_data().await?;
     Ok(())
 }
 
-fn snapshot_frames_for_entry((key, entry): (Bytes, Entry)) -> Vec<Frame> {
+async fn write_snapshot_entry(
+    file: &mut File,
+    buf: &mut BytesMut,
+    key: Bytes,
+    entry: Entry,
+) -> anyhow::Result<()> {
+    if entry_expired(&entry) {
+        return Ok(());
+    }
     match entry.value {
         Value::String(value) => {
-            let mut parts = vec![bulk_static(b"SET"), Frame::Bulk(key), Frame::Bulk(value)];
-            if let Some(deadline) = entry.expires_at {
-                push_set_expiry(&mut parts, deadline);
-            }
-            vec![Frame::Array(parts)]
+            write_string_snapshot(file, buf, key, value, entry.expires_at).await
         }
         Value::List(values) if !values.is_empty() => {
-            let mut parts = Vec::with_capacity(values.len() + 2);
-            parts.push(bulk_static(b"RPUSH"));
-            parts.push(Frame::Bulk(key.clone()));
-            parts.extend(values.into_iter().map(Frame::Bulk));
-            let mut frames = vec![Frame::Array(parts)];
-            if let Some(deadline) = entry.expires_at {
-                frames.push(pexpireat_frame(key, deadline));
-            }
-            frames
+            write_list_snapshot(file, buf, key, values, entry.expires_at).await
         }
         Value::Hash(values) if !values.is_empty() => {
-            let mut fields: Vec<_> = values.into_iter().collect();
-            fields.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
-            let mut parts = Vec::with_capacity(fields.len() * 2 + 2);
-            parts.push(bulk_static(b"HSET"));
-            parts.push(Frame::Bulk(key.clone()));
-            for (field, value) in fields {
-                parts.push(Frame::Bulk(field));
-                parts.push(Frame::Bulk(value));
-            }
-            let mut frames = vec![Frame::Array(parts)];
-            if let Some(deadline) = entry.expires_at {
-                frames.push(pexpireat_frame(key, deadline));
-            }
-            frames
+            write_hash_snapshot(file, buf, key, values, entry.expires_at).await
         }
-        Value::List(_) | Value::Hash(_) => Vec::new(),
+        Value::List(_) | Value::Hash(_) => Ok(()),
     }
+}
+
+async fn write_string_snapshot(
+    file: &mut File,
+    buf: &mut BytesMut,
+    key: Bytes,
+    value: Bytes,
+    expires_at: Option<ExpireAt>,
+) -> anyhow::Result<()> {
+    let full_set = set_frame(key.clone(), value.clone(), expires_at);
+    if frame_is_replayable(&full_set) {
+        write_replayable_snapshot_frame(file, buf, &full_set).await?;
+        return Ok(());
+    }
+
+    write_replayable_snapshot_frame(file, buf, &set_frame(key.clone(), Bytes::new(), None)).await?;
+    let chunk_len = max_append_chunk_len(&key).ok_or_else(|| {
+        anyhow::anyhow!("AOF rewrite cannot encode APPEND frame within replay limit")
+    })?;
+    if chunk_len == 0 && !value.is_empty() {
+        anyhow::bail!("AOF rewrite cannot encode non-empty string chunks within replay limit");
+    }
+    let mut offset = 0usize;
+    while offset < value.len() {
+        let end = offset.saturating_add(chunk_len).min(value.len());
+        let chunk = value.slice(offset..end);
+        let frame = Frame::Array(vec![
+            bulk_static(b"APPEND"),
+            Frame::Bulk(key.clone()),
+            Frame::Bulk(chunk),
+        ]);
+        write_replayable_snapshot_frame(file, buf, &frame).await?;
+        offset = end;
+    }
+    write_expiry_snapshot(file, buf, key, expires_at).await
+}
+
+async fn write_list_snapshot(
+    file: &mut File,
+    buf: &mut BytesMut,
+    key: Bytes,
+    values: std::collections::VecDeque<Bytes>,
+    expires_at: Option<ExpireAt>,
+) -> anyhow::Result<()> {
+    let mut current = Vec::new();
+    let mut payload_len = 0usize;
+    for value in values {
+        let value_len = limits::resp_bulk_len(value.len())
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite list element length overflow"))?;
+        let next_len =
+            chunked_command_len(b"RPUSH", &key, current.len() + 1, payload_len + value_len)
+                .ok_or_else(|| anyhow::anyhow!("AOF rewrite RPUSH frame length overflow"))?;
+        if next_len <= MAX_AOF_BUFFERED_FRAME_BYTES {
+            current.push(value);
+            payload_len += value_len;
+            continue;
+        }
+        if current.is_empty() {
+            anyhow::bail!("AOF rewrite list element exceeds replayable frame limit");
+        }
+        write_rpush_snapshot(file, buf, &key, std::mem::take(&mut current)).await?;
+
+        let single_len = chunked_command_len(b"RPUSH", &key, 1, value_len)
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite RPUSH frame length overflow"))?;
+        if single_len > MAX_AOF_BUFFERED_FRAME_BYTES {
+            anyhow::bail!("AOF rewrite list element exceeds replayable frame limit");
+        }
+        current.push(value);
+        payload_len = value_len;
+    }
+    if !current.is_empty() {
+        write_rpush_snapshot(file, buf, &key, current).await?;
+    }
+    write_expiry_snapshot(file, buf, key, expires_at).await
+}
+
+async fn write_hash_snapshot(
+    file: &mut File,
+    buf: &mut BytesMut,
+    key: Bytes,
+    values: std::collections::HashMap<Bytes, Bytes>,
+    expires_at: Option<ExpireAt>,
+) -> anyhow::Result<()> {
+    let mut fields: Vec<_> = values.into_iter().collect();
+    fields.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
+
+    let mut current = Vec::new();
+    let mut payload_len = 0usize;
+    for (field, value) in fields {
+        let field_len = limits::resp_bulk_len(field.len())
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite hash field length overflow"))?;
+        let value_len = limits::resp_bulk_len(value.len())
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite hash value length overflow"))?;
+        let pair_len = field_len
+            .checked_add(value_len)
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite hash pair length overflow"))?;
+        let next_payload_len = payload_len
+            .checked_add(pair_len)
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite HSET frame length overflow"))?;
+        let next_len =
+            chunked_command_len(b"HSET", &key, (current.len() + 1) * 2, next_payload_len)
+                .ok_or_else(|| anyhow::anyhow!("AOF rewrite HSET frame length overflow"))?;
+        if next_len <= MAX_AOF_BUFFERED_FRAME_BYTES {
+            current.push((field, value));
+            payload_len = next_payload_len;
+            continue;
+        }
+        if current.is_empty() {
+            anyhow::bail!("AOF rewrite hash pair exceeds replayable frame limit");
+        }
+        write_hset_snapshot(file, buf, &key, std::mem::take(&mut current)).await?;
+
+        let single_len = chunked_command_len(b"HSET", &key, 2, pair_len)
+            .ok_or_else(|| anyhow::anyhow!("AOF rewrite HSET frame length overflow"))?;
+        if single_len > MAX_AOF_BUFFERED_FRAME_BYTES {
+            anyhow::bail!("AOF rewrite hash pair exceeds replayable frame limit");
+        }
+        current.push((field, value));
+        payload_len = pair_len;
+    }
+    if !current.is_empty() {
+        write_hset_snapshot(file, buf, &key, current).await?;
+    }
+    write_expiry_snapshot(file, buf, key, expires_at).await
+}
+
+async fn write_rpush_snapshot(
+    file: &mut File,
+    buf: &mut BytesMut,
+    key: &Bytes,
+    values: Vec<Bytes>,
+) -> anyhow::Result<()> {
+    let mut parts = Vec::with_capacity(values.len() + 2);
+    parts.push(bulk_static(b"RPUSH"));
+    parts.push(Frame::Bulk(key.clone()));
+    parts.extend(values.into_iter().map(Frame::Bulk));
+    write_replayable_snapshot_frame(file, buf, &Frame::Array(parts)).await
+}
+
+async fn write_hset_snapshot(
+    file: &mut File,
+    buf: &mut BytesMut,
+    key: &Bytes,
+    pairs: Vec<(Bytes, Bytes)>,
+) -> anyhow::Result<()> {
+    let mut parts = Vec::with_capacity(pairs.len() * 2 + 2);
+    parts.push(bulk_static(b"HSET"));
+    parts.push(Frame::Bulk(key.clone()));
+    for (field, value) in pairs {
+        parts.push(Frame::Bulk(field));
+        parts.push(Frame::Bulk(value));
+    }
+    write_replayable_snapshot_frame(file, buf, &Frame::Array(parts)).await
+}
+
+async fn write_expiry_snapshot(
+    file: &mut File,
+    buf: &mut BytesMut,
+    key: Bytes,
+    expires_at: Option<ExpireAt>,
+) -> anyhow::Result<()> {
+    if let Some(deadline) = expires_at {
+        let frame = expiry_frame(key, deadline);
+        write_replayable_snapshot_frame(file, buf, &frame).await?;
+    }
+    Ok(())
+}
+
+async fn write_replayable_snapshot_frame(
+    file: &mut File,
+    buf: &mut BytesMut,
+    frame: &Frame,
+) -> anyhow::Result<()> {
+    let len = encoder::encoded_len(frame)
+        .ok_or_else(|| anyhow::anyhow!("AOF rewrite frame length overflow"))?;
+    if len > MAX_AOF_BUFFERED_FRAME_BYTES {
+        anyhow::bail!(
+            "AOF rewrite frame length {len} exceeds replay limit {MAX_AOF_BUFFERED_FRAME_BYTES}"
+        );
+    }
+    buf.clear();
+    encoder::encode(frame, buf);
+    file.write_all(buf).await?;
+    Ok(())
+}
+
+fn frame_is_replayable(frame: &Frame) -> bool {
+    encoder::encoded_len(frame).is_some_and(|len| len <= MAX_AOF_BUFFERED_FRAME_BYTES)
+}
+
+fn set_frame(key: Bytes, value: Bytes, expires_at: Option<ExpireAt>) -> Frame {
+    let mut parts = vec![bulk_static(b"SET"), Frame::Bulk(key), Frame::Bulk(value)];
+    if let Some(deadline) = expires_at {
+        push_set_expiry(&mut parts, deadline);
+    }
+    Frame::Array(parts)
+}
+
+fn max_append_chunk_len(key: &Bytes) -> Option<usize> {
+    let base_len = command_key_base_len(b"APPEND", key, 3)?;
+    max_payload_len_for_frame(base_len)
+}
+
+fn max_payload_len_for_frame(base_len: usize) -> Option<usize> {
+    if base_len.checked_add(limits::resp_bulk_len(0)?)? > MAX_AOF_BUFFERED_FRAME_BYTES {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = limits::MAX_BULK_LEN.min(MAX_AOF_BUFFERED_FRAME_BYTES);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let fits = base_len
+            .checked_add(limits::resp_bulk_len(mid)?)
+            .is_some_and(|len| len <= MAX_AOF_BUFFERED_FRAME_BYTES);
+        if fits {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
+}
+
+fn chunked_command_len(
+    command: &'static [u8],
+    key: &Bytes,
+    payload_items: usize,
+    payload_len: usize,
+) -> Option<usize> {
+    command_key_base_len(command, key, payload_items + 2)?.checked_add(payload_len)
+}
+
+fn command_key_base_len(command: &'static [u8], key: &Bytes, total_items: usize) -> Option<usize> {
+    limits::resp_array_header_len(total_items)?
+        .checked_add(limits::resp_bulk_len(command.len())?)?
+        .checked_add(limits::resp_bulk_len(key.len())?)
 }
 
 fn bulk_static(bytes: &'static [u8]) -> Frame {
@@ -493,6 +722,22 @@ fn pexpireat_frame(key: Bytes, deadline: ExpireAt) -> Frame {
         Frame::Bulk(key),
         bulk_string(deadline),
     ])
+}
+
+fn pexpire_frame(key: Bytes, ttl_ms: ExpireAt) -> Frame {
+    Frame::Array(vec![
+        bulk_static(b"PEXPIRE"),
+        Frame::Bulk(key),
+        bulk_string(ttl_ms),
+    ])
+}
+
+fn expiry_frame(key: Bytes, deadline: ExpireAt) -> Frame {
+    if deadline <= MAX_EXPIRE_AT_MS {
+        pexpireat_frame(key, deadline)
+    } else {
+        pexpire_frame(key, relative_millis_for_aof(deadline))
+    }
 }
 
 async fn run_writer(

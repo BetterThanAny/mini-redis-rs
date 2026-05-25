@@ -5,6 +5,8 @@ use tokio::net::TcpStream;
 mod common;
 use common::{array, read_n, read_some, send, spawn_server};
 
+const MAX_RETURNABLE_TEST_STRING_LEN: usize = 64 * 1024 * 1024 - 16;
+
 #[tokio::test]
 async fn set_then_get() {
     let (addr, _g) = spawn_server().await;
@@ -144,6 +146,26 @@ fn large_mget_response_is_rejected_before_cloning_all_values() {
         Frame::Error(err) => assert!(err.contains("response exceeds output limit")),
         other => panic!("expected response limit error, got {other:?}"),
     }
+}
+
+#[test]
+fn oversized_append_does_not_create_unreturnable_string() {
+    let db = Db::new();
+    let key = Bytes::from_static(b"huge-string");
+    let value = Bytes::from(vec![b'x'; MAX_RETURNABLE_TEST_STRING_LEN]);
+    assert_eq!(
+        string::set_at(&db, key.clone(), value, None),
+        Frame::Simple("OK".into())
+    );
+
+    match string::append(&db, key.clone(), Bytes::from_static(b"!!!!")) {
+        Frame::Error(err) => assert!(err.contains("response exceeds output limit")),
+        other => panic!("expected response limit error, got {other:?}"),
+    }
+    assert_eq!(
+        string::strlen(&db, &key),
+        Frame::Integer(MAX_RETURNABLE_TEST_STRING_LEN as i64)
+    );
 }
 
 #[tokio::test]

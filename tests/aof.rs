@@ -1,5 +1,8 @@
+use bytes::Bytes;
 use mini_redis_rs::aof::{self, FsyncPolicy};
+use mini_redis_rs::cmd::string;
 use mini_redis_rs::db::Db;
+use mini_redis_rs::resp::Frame;
 use mini_redis_rs::server;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -8,6 +11,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 mod common;
 use common::{array, read_n, read_some, send};
+
+const MAX_RETURNABLE_TEST_STRING_LEN: usize = 64 * 1024 * 1024 - 16;
 
 /// AOF-aware server spawner — distinct from `common::spawn_server` because it
 /// also wires up `aof::replay` + `aof::spawn_writer`.
@@ -305,6 +310,49 @@ async fn bgrewriteaof_compacts_file_and_replays_new_state() {
             b"*2\r\n$5\r\nfield\r\n$5\r\nvalue\r\n"
         );
     }
+}
+
+#[tokio::test]
+async fn bgrewriteaof_chunks_large_string_snapshot_for_replay() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("large-string-rewrite.aof");
+    let db = Db::new();
+    let key = Bytes::from_static(b"large-string");
+    let value_len = MAX_RETURNABLE_TEST_STRING_LEN;
+    let value = Bytes::from(vec![b'x'; value_len]);
+    assert_eq!(
+        string::set_at(&db, key.clone(), value, None),
+        Frame::Simple("OK".into())
+    );
+
+    let handle = aof::spawn_writer(path.clone(), FsyncPolicy::Always)
+        .await
+        .unwrap();
+    handle.rewrite_now(db.clone()).await.unwrap();
+    drop(handle);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let rewritten_size = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        rewritten_size > value_len as u64,
+        "rewrite should contain chunked rebuild commands"
+    );
+
+    let replayed = Db::new();
+    let applied = aof::replay(&path, &replayed).await.unwrap();
+    assert!(
+        applied > 1,
+        "large string should replay from SET plus APPEND chunks, got {applied}"
+    );
+    assert_eq!(
+        string::strlen(&replayed, &key),
+        Frame::Integer(value_len as i64)
+    );
+    assert_ne!(
+        std::fs::metadata(&path).unwrap().len(),
+        0,
+        "replay must not truncate the rewritten AOF"
+    );
 }
 
 #[tokio::test]

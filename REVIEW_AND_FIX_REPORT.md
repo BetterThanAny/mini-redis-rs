@@ -11,4 +11,6 @@
 - `git diff --check` passed.
 
 ## Remaining
-- AOF still records relative TTL commands and can resurrect expired keys after replay. I left that larger persistence design for a separate pass.
+- Historical note resolved in later commits: AOF now writes absolute TTLs where
+  Redis accepts them, keeps extremely large Redis-compatible relative TTLs
+  replayable, and has regression coverage for restart behavior.

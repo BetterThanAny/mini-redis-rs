@@ -278,10 +278,6 @@ pub(crate) fn info_frame(
         out.push_str("\r\n");
     }
 
-    if out.is_empty() {
-        out.push_str("# Error\r\nunsupported_info_section:1\r\n\r\n");
-    }
-
     Frame::Bulk(Bytes::from(out))
 }
 

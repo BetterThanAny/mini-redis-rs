@@ -26,6 +26,10 @@ pub fn checked_add_response_len(total: &mut usize, add: usize) -> bool {
     }
 }
 
+pub fn bulk_response_fits(len: usize) -> bool {
+    resp_bulk_len(len).is_some_and(|bulk_len| bulk_len <= MAX_RESPONSE_FRAME_BYTES)
+}
+
 pub fn response_too_large() -> Frame {
     Frame::Error(format!(
         "ERR response exceeds output limit of {MAX_RESPONSE_FRAME_BYTES} bytes"

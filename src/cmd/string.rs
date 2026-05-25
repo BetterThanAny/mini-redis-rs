@@ -25,6 +25,9 @@ pub fn set(db: &Db, key: Bytes, value: Bytes, ex: Option<Duration>) -> Frame {
 }
 
 pub fn set_at(db: &Db, key: Bytes, value: Bytes, expires_at: Option<ExpireAt>) -> Frame {
+    if !limits::bulk_response_fits(value.len()) {
+        return limits::response_too_large();
+    }
     let mut shard = db.shard_for(&key).lock().unwrap();
     // If overwriting an entry that had a TTL, drop the stale BTreeMap row
     // so the index doesn't grow unboundedly under SET EX / EXPIRE churn.
@@ -108,7 +111,13 @@ pub fn append(db: &Db, key: Bytes, suffix: Bytes) -> Frame {
     });
     match &mut entry.value {
         Value::String(b) => {
-            let mut combined = bytes::BytesMut::with_capacity(b.len() + suffix.len());
+            let Some(new_len) = b.len().checked_add(suffix.len()) else {
+                return limits::response_too_large();
+            };
+            if !limits::bulk_response_fits(new_len) {
+                return limits::response_too_large();
+            }
+            let mut combined = bytes::BytesMut::with_capacity(new_len);
             combined.extend_from_slice(b);
             combined.extend_from_slice(&suffix);
             *b = combined.freeze();
@@ -169,6 +178,12 @@ pub fn mget(db: &Db, keys: &[Bytes]) -> Frame {
 }
 
 pub fn mset(db: &Db, pairs: Vec<(Bytes, Bytes)>) -> Frame {
+    if pairs
+        .iter()
+        .any(|(_, value)| !limits::bulk_response_fits(value.len()))
+    {
+        return limits::response_too_large();
+    }
     for (k, v) in pairs {
         let mut shard = db.shard_for(&k).lock().unwrap();
         if let Some(old) = shard.entries.get(&k).and_then(|e| e.expires_at) {

@@ -95,3 +95,12 @@ async fn info_returns_bulk_sections_for_redis_cli() {
         "expected no-AOF persistence state: {text}"
     );
 }
+
+#[tokio::test]
+async fn unknown_info_section_returns_empty_bulk_like_redis() {
+    let (addr, _shutdown) = spawn_server().await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+
+    send(&mut client, &array(&[b"INFO", b"nosuch"])).await;
+    assert_eq!(read_n(&mut client, 6).await, b"$0\r\n\r\n");
+}

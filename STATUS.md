@@ -4,10 +4,10 @@
 > original design (preserved for context); STATUS.md is what's actually true now.
 
 **Last updated:** 2026-05-25
-**Branch:** `main` · 25 commits · clean working tree
-**Tests:** 118/118 passing
+**Branch:** `main` · 26 commits · clean working tree
+**Tests:** 121/121 passing
 **Lint:** `cargo clippy --all-targets -- -D warnings` clean
-**LoC:** src 3,384 · tests 2,043 · total ≈ 5,430
+**LoC:** src 3,644 · tests 2,122 · total ≈ 5,766
 
 ---
 
@@ -15,7 +15,7 @@
 
 ```bash
 cd $HOME/Desktop/Work/mini-redis-rs
-cargo test                                      # all 89 should pass
+cargo test                                      # all 121 should pass
 cargo clippy --all-targets -- -D warnings       # clean
 cargo build --release
 ./target/release/miniredisd --port 6380 &
@@ -24,7 +24,7 @@ redis-cli -p 6380 SET k v && redis-cli -p 6380 GET k
 kill %1
 ```
 
-If any of those fail, something has rotted since 2026-04-27.
+If any of those fail, something has rotted since 2026-05-25.
 
 ---
 
@@ -74,15 +74,13 @@ Original rating: **8/10**. Findings categorized by severity.
 
 | ID | Why deferred |
 |---|---|
-| **C2** AOF ack-before-write (client gets `+OK` before bytes reach disk) | Real fix needs `AofHandle::write` to be `async` with oneshot completion + handler awaits before responding. Big refactor; demo-tier honesty: documented in code comments + this STATUS. |
-| **L7** AOF write failure logs but continues | Production needs to propagate (close handle + reject writes). Demo OK. |
 | **H3** `std::sync::Mutex` in async context | Lock hold times are short and don't cross `await`. Documented constraint, not a bug. |
 | **H5** `SET EX 0` vs `EXPIRE 0` error-message inconsistency | Wire-level both `-ERR`; client doesn't care. |
 | **N3** `Db::iter_shards` exposes `&Mutex<Shard>` | Only `expire::sweep_once` uses it; encapsulation gain not worth the API churn. |
 | **L1** `memchr`-based CRLF scan | Microopt; benchmark is already 80–98% of Redis. |
 | **M3** `parse_*` arg-extraction templates | Some duplication in `cmd/mod.rs` (`let mut it = rest.into_iter(); let key = it.next().unwrap()`) but extracting helpers for 2/3-arg cases doesn't dominate readability. |
 
-If picking this back up, **C2 is the only one with real correctness implications** — the rest are quality-of-implementation, not bugs.
+Known deferrals here are quality-of-implementation issues, not confirmed correctness bugs.
 
 ---
 
@@ -117,7 +115,7 @@ in `Cargo.toml`, fetched on `cargo build` — no system pollution.
 ```
 mini-redis-rs/
 ├── Cargo.toml
-├── Cargo.lock                    # gitignored
+├── Cargo.lock                    # tracked lockfile
 ├── PLAN.md                       # original design (do not modify; it's history)
 ├── STATUS.md                     # this file — read first
 ├── README.md                     # user-facing docs
@@ -159,9 +157,9 @@ mini-redis-rs/
 ## Quick "where do I pick up" guide for the next session
 
 1. **Read this file first** (you are here).
-2. **`git log --oneline`** — see the 15-commit story.
+2. **`git log --oneline`** — see the 26-commit story.
 3. **`cargo test`** — confirm the integration suite still passes.
 4. If picking up further work, the most worthwhile next things are:
-   - **AOF scaling**: replay still reads the full AOF into memory, and rewrite still snapshots the full DB before writing; make those paths streaming if the project grows beyond teaching-scale datasets.
+   - **AOF scaling/stress**: rewrite now serializes snapshots shard-by-shard and chunks generated frames, but very large datasets still need sustained memory/latency stress testing.
    - **Sorted sets (Phase 2)**: requires a sorted data structure (BTreeMap of score→Vec<Bytes> + HashMap of member→score), then ZADD/ZRANGE/ZRANGEBYSCORE/ZREM/ZRANGEBYLEX. Probably its own milestone-sized chunk.
    - **Cluster mode** is interesting but a much bigger lift (slot routing, gossip, MOVED redirects).
