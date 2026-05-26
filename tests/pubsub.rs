@@ -91,6 +91,23 @@ async fn unsubscribe_specific_channel() {
 }
 
 #[tokio::test]
+async fn unsubscribe_in_normal_mode_returns_acks() {
+    let (addr, _g) = spawn_server().await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+
+    send(&mut s, &array(&[b"UNSUBSCRIBE"])).await;
+    assert_eq!(
+        read_some(&mut s).await,
+        b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n"
+    );
+
+    send(&mut s, &array(&[b"UNSUBSCRIBE", b"a", b"b"])).await;
+    let expected =
+        b"*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:0\r\n*3\r\n$11\r\nunsubscribe\r\n$1\r\nb\r\n:0\r\n";
+    assert_eq!(read_n(&mut s, expected.len()).await, expected);
+}
+
+#[tokio::test]
 async fn ping_works_in_subscribed_mode() {
     let (addr, _g) = spawn_server().await;
     let mut sub = TcpStream::connect(addr).await.unwrap();

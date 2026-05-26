@@ -1,5 +1,5 @@
 use crate::aof::AofHandle;
-use crate::cmd::Command;
+use crate::cmd::{Command, ParseError};
 use crate::connection::{Connection, ReadError};
 use crate::db::Db;
 use crate::resp::Frame;
@@ -100,11 +100,16 @@ async fn handle(
             Ok(Command::Subscribe(channels)) => {
                 run_subscribed(&mut conn, &db, channels).await?;
             }
+            Ok(Command::Unsubscribe(channels)) => match channels {
+                Some(channels) => {
+                    for channel in channels {
+                        ack_unsubscribe(&mut conn, Some(&channel), 0).await?;
+                    }
+                }
+                None => ack_unsubscribe(&mut conn, None, 0).await?,
+            },
             Ok(Command::Info(section)) => {
-                let resp = {
-                    let _read_guard = db.write_guard().await;
-                    info_frame(&db, aof.as_ref(), Some(&state), section.as_deref())
-                };
+                let resp = info_frame(&db, aof.as_ref(), Some(&state), section.as_deref());
                 conn.write_frame(&resp).await?;
             }
             Ok(Command::BgRewriteAof) => {
@@ -149,14 +154,12 @@ async fn handle(
                         resp
                     }
                 } else {
-                    let _read_guard = db.write_guard().await;
                     cmd.apply(&db)
                 };
                 conn.write_frame(&resp).await?;
             }
             Err(e) => {
-                conn.write_frame(&Frame::Error(format!("ERR {}", e)))
-                    .await?;
+                handle_command_parse_error(&mut conn, e).await?;
             }
         }
     }
@@ -179,6 +182,19 @@ fn protocol_error_frame(message: &str) -> Frame {
         "ERR Protocol error: {}",
         sanitize_error_message(message)
     ))
+}
+
+async fn handle_command_parse_error(conn: &mut Connection, err: ParseError) -> anyhow::Result<()> {
+    if matches!(err, ParseError::Empty) {
+        return Ok(());
+    }
+    if err.is_protocol_error() {
+        let message = err.to_string();
+        let _ = conn.write_frame(&protocol_error_frame(&message)).await;
+        return Err(ReadError::Protocol(message).into());
+    }
+    conn.write_frame(&Frame::Error(format!("ERR {}", err)))
+        .await
 }
 
 fn sanitize_error_message(value: &str) -> String {
@@ -385,7 +401,7 @@ async fn run_subscribed(
                         )).await?;
                     }
                     Err(e) => {
-                        conn.write_frame(&Frame::Error(format!("ERR {}", e))).await?;
+                        handle_command_parse_error(conn, e).await?;
                     }
                 }
             }
@@ -461,6 +477,19 @@ async fn ack_subscribe(
     conn.write_frame(&Frame::Array(vec![
         Frame::Bulk(Bytes::from_static(tag)),
         Frame::Bulk(channel.clone()),
+        Frame::Integer(count as i64),
+    ]))
+    .await
+}
+
+async fn ack_unsubscribe(
+    conn: &mut Connection,
+    channel: Option<&Bytes>,
+    count: usize,
+) -> anyhow::Result<()> {
+    conn.write_frame(&Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"unsubscribe")),
+        channel.cloned().map(Frame::Bulk).unwrap_or(Frame::Null),
         Frame::Integer(count as i64),
     ]))
     .await

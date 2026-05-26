@@ -293,6 +293,12 @@ pub enum ParseError {
     Syntax,
 }
 
+impl ParseError {
+    pub fn is_protocol_error(&self) -> bool {
+        matches!(self, ParseError::NotArray | ParseError::NotBulk(_))
+    }
+}
+
 impl Command {
     pub fn from_frame(frame: Frame) -> Result<Self, ParseError> {
         let mut items = match frame {

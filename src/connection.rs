@@ -37,21 +37,17 @@ impl Connection {
 
     pub async fn read_frame(&mut self) -> Result<Option<Frame>, ReadError> {
         loop {
+            self.check_buffered_frame_limit()?;
             match parser::parse(&mut self.buf) {
                 Ok(Some(frame)) => return Ok(Some(frame)),
                 Ok(None) => {}
                 Err(crate::resp::Error::Incomplete) => {}
                 Err(crate::resp::Error::Protocol(msg)) => return Err(ReadError::Protocol(msg)),
             }
-            if self.buf.len() > crate::limits::MAX_BUFFERED_FRAME_BYTES {
-                return Err(ReadError::Protocol(format!(
-                    "client frame exceeds buffered limit of {} bytes",
-                    crate::limits::MAX_BUFFERED_FRAME_BYTES
-                )));
-            }
             let n = timeout(READ_IDLE_TIMEOUT, self.stream.read_buf(&mut self.buf))
                 .await
                 .map_err(|_| ReadError::ReadIdleTimeout)??;
+            self.check_buffered_frame_limit()?;
             if n == 0 {
                 if self.buf.is_empty() {
                     return Ok(None);
@@ -59,6 +55,16 @@ impl Connection {
                 return Err(ReadError::ClosedMidFrame);
             }
         }
+    }
+
+    fn check_buffered_frame_limit(&self) -> Result<(), ReadError> {
+        if self.buf.len() > crate::limits::MAX_BUFFERED_FRAME_BYTES {
+            return Err(ReadError::Protocol(format!(
+                "client frame exceeds buffered limit of {} bytes",
+                crate::limits::MAX_BUFFERED_FRAME_BYTES
+            )));
+        }
+        Ok(())
     }
 
     pub async fn write_frame(&mut self, frame: &Frame) -> anyhow::Result<()> {

@@ -31,6 +31,12 @@ pub fn parse(buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
         return match parse_frame(&mut cursor, 0) {
             Ok(frame) => {
                 let n = cursor.position() as usize;
+                if n > crate::limits::MAX_BUFFERED_FRAME_BYTES {
+                    return Err(Error::Protocol(format!(
+                        "frame length {n} exceeds buffered limit {}",
+                        crate::limits::MAX_BUFFERED_FRAME_BYTES
+                    )));
+                }
                 buf.advance(n);
                 Ok(Some(frame))
             }
@@ -208,6 +214,15 @@ fn parse_bulk(c: &mut std::io::Cursor<&[u8]>) -> Result<Frame, Error> {
     if len > MAX_BULK_LEN {
         return Err(Error::Protocol(format!(
             "bulk length {len} exceeds limit {MAX_BULK_LEN}"
+        )));
+    }
+    if !matches!(
+        crate::limits::resp_bulk_len(len),
+        Some(n) if n <= crate::limits::MAX_BUFFERED_FRAME_BYTES
+    ) {
+        return Err(Error::Protocol(format!(
+            "bulk frame length exceeds buffered limit {}",
+            crate::limits::MAX_BUFFERED_FRAME_BYTES
         )));
     }
     let remaining = c.get_ref().len() - c.position() as usize;

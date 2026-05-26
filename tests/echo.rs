@@ -5,6 +5,16 @@ use tokio::net::TcpStream;
 mod common;
 use common::spawn_server;
 
+async fn read_available(sock: &mut TcpStream) -> Vec<u8> {
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    buf.truncate(n);
+    buf
+}
+
 #[tokio::test]
 async fn ping_pong() {
     let (addr, _shutdown) = spawn_server().await;
@@ -121,6 +131,77 @@ async fn protocol_errors_return_err_before_disconnect() {
         .unwrap()
         .unwrap();
     assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn non_array_resp_frame_is_protocol_error_and_disconnects() {
+    let (addr, _shutdown) = spawn_server().await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"+PING\r\n*1\r\n$4\r\nPING\r\n")
+        .await
+        .unwrap();
+
+    let resp = read_available(&mut sock).await;
+    assert!(resp.starts_with(b"-ERR Protocol error:"), "got: {resp:?}");
+
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn non_bulk_command_argument_is_protocol_error_and_disconnects() {
+    let (addr, _shutdown) = spawn_server().await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"*1\r\n+PING\r\n*1\r\n$4\r\nPING\r\n")
+        .await
+        .unwrap();
+
+    let resp = read_available(&mut sock).await;
+    assert!(resp.starts_with(b"-ERR Protocol error:"), "got: {resp:?}");
+
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn complete_frame_over_buffer_limit_is_rejected_before_command_runs() {
+    let (addr, _shutdown) = spawn_server().await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    let value_len = 64 * 1024 * 1024 - 16;
+    let mut request = format!("*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n${value_len}\r\n").into_bytes();
+    request.resize(request.len() + value_len, b'x');
+    request.extend_from_slice(b"\r\n*1\r\n$4\r\nPING\r\n");
+    sock.write_all(&request).await.unwrap();
+
+    let resp = read_available(&mut sock).await;
+    assert!(resp.starts_with(b"-ERR Protocol error:"), "got: {resp:?}");
+
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0);
+
+    let mut check = TcpStream::connect(addr).await.unwrap();
+    check
+        .write_all(b"*2\r\n$6\r\nSTRLEN\r\n$3\r\nbig\r\n")
+        .await
+        .unwrap();
+    let mut len_resp = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(2), check.read_exact(&mut len_resp))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&len_resp, b":0\r\n");
 }
 
 #[tokio::test]

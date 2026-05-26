@@ -389,14 +389,14 @@ async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
         drop(write_pause);
         return Err(err);
     }
+    let snapshot = db.aof_snapshot_entries();
+    drop(write_pause);
 
-    if let Err(err) = write_snapshot_from_db(&temp_path, &db).await {
-        drop(write_pause);
+    if let Err(err) = write_snapshot_entries(&temp_path, snapshot).await {
         handle.abort_rewrite(err.to_string()).await;
         let _ = fs::remove_file(&temp_path).await;
         return Err(err);
     }
-    drop(write_pause);
 
     if let Err(err) = handle.finish_rewrite(temp_path.clone()).await {
         let _ = fs::remove_file(&temp_path).await;
@@ -406,7 +406,7 @@ async fn rewrite_inner(handle: AofHandle, db: Db) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn write_snapshot_from_db(path: &Path, db: &Db) -> anyhow::Result<()> {
+async fn write_snapshot_entries(path: &Path, entries: Vec<(Bytes, Entry)>) -> anyhow::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -414,20 +414,8 @@ async fn write_snapshot_from_db(path: &Path, db: &Db) -> anyhow::Result<()> {
         .open(path)
         .await?;
     let mut buf = BytesMut::new();
-    for shard_mu in db.iter_shards() {
-        let mut entries: Vec<(Bytes, Entry)> = {
-            let shard = shard_mu.lock().unwrap();
-            shard
-                .entries
-                .iter()
-                .filter(|(_, entry)| !entry_expired(entry))
-                .map(|(key, entry)| (key.clone(), entry.clone()))
-                .collect()
-        };
-        entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
-        for (key, entry) in entries {
-            write_snapshot_entry(&mut file, &mut buf, key, entry).await?;
-        }
+    for (key, entry) in entries {
+        write_snapshot_entry(&mut file, &mut buf, key, entry).await?;
     }
     file.sync_data().await?;
     Ok(())
