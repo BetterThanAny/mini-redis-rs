@@ -3,9 +3,9 @@
 > Snapshot for the next session. Read this **before** PLAN.md — PLAN.md is the
 > original design (preserved for context); STATUS.md is what's actually true now.
 
-**Last updated:** 2026-05-25
-**Branch:** `main` · 26 commits · clean working tree
-**Tests:** 121/121 passing
+**Last updated:** 2026-05-26
+**Branch:** `main` · 27 commits · clean working tree
+**Tests:** 129/129 passing
 **Lint:** `cargo clippy --all-targets -- -D warnings` clean
 **LoC:** src 3,644 · tests 2,122 · total ≈ 5,766
 
@@ -15,7 +15,7 @@
 
 ```bash
 cd $HOME/Desktop/Work/mini-redis-rs
-cargo test                                      # all 121 should pass
+cargo test                                      # all 129 should pass
 cargo clippy --all-targets -- -D warnings       # clean
 cargo build --release
 ./target/release/miniredisd --port 6380 &

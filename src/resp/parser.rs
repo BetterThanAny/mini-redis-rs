@@ -14,16 +14,172 @@ const MAX_NESTING_DEPTH: usize = 128;
 const MAX_LINE_LEN: usize = 1024 * 1024;
 
 pub fn parse(buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
-    let mut cursor = std::io::Cursor::new(&buf[..]);
-    match parse_frame(&mut cursor, 0) {
-        Ok(frame) => {
-            let n = cursor.position() as usize;
-            buf.advance(n);
-            Ok(Some(frame))
+    loop {
+        if buf.is_empty() {
+            return Ok(None);
         }
-        Err(Error::Incomplete) => Ok(None),
-        Err(e) => Err(e),
+        if !is_resp_type(buf[0]) {
+            let before_len = buf.len();
+            match parse_inline(buf)? {
+                Some(frame) => return Ok(Some(frame)),
+                None if buf.len() == before_len => return Ok(None),
+                None => continue,
+            }
+        }
+
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        return match parse_frame(&mut cursor, 0) {
+            Ok(frame) => {
+                let n = cursor.position() as usize;
+                buf.advance(n);
+                Ok(Some(frame))
+            }
+            Err(Error::Incomplete) => Ok(None),
+            Err(e) => Err(e),
+        };
     }
+}
+
+fn is_resp_type(byte: u8) -> bool {
+    matches!(byte, b'+' | b'-' | b':' | b'$' | b'*')
+}
+
+fn parse_inline(buf: &mut BytesMut) -> Result<Option<Frame>, Error> {
+    let line_end = match find_lf(buf, 0) {
+        Some(pos) => pos,
+        None if buf.len() > MAX_LINE_LEN => {
+            return Err(Error::Protocol(format!(
+                "line length exceeds limit {MAX_LINE_LEN}"
+            )));
+        }
+        None => return Ok(None),
+    };
+    if line_end > MAX_LINE_LEN {
+        return Err(Error::Protocol(format!(
+            "line length exceeds limit {MAX_LINE_LEN}"
+        )));
+    }
+
+    let mut line = &buf[..line_end];
+    if line.ends_with(b"\r") {
+        line = &line[..line.len() - 1];
+    }
+    let frame = inline_frame(line)?;
+    buf.advance(line_end + 1);
+    Ok(frame)
+}
+
+fn inline_frame(line: &[u8]) -> Result<Option<Frame>, Error> {
+    let args = split_inline_args(line)?;
+    if args.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Frame::Array(
+        args.into_iter().map(Frame::Bulk).collect(),
+    )))
+}
+
+fn split_inline_args(line: &[u8]) -> Result<Vec<Bytes>, Error> {
+    let mut args = Vec::new();
+    let mut idx = 0usize;
+    while idx < line.len() {
+        while idx < line.len() && is_inline_space(line[idx]) {
+            idx += 1;
+        }
+        if idx == line.len() {
+            break;
+        }
+
+        let mut arg = Vec::new();
+        while idx < line.len() && !is_inline_space(line[idx]) {
+            match line[idx] {
+                b'\'' => {
+                    idx += 1;
+                    read_inline_quoted(line, &mut idx, &mut arg, b'\'')?;
+                }
+                b'"' => {
+                    idx += 1;
+                    read_inline_quoted(line, &mut idx, &mut arg, b'"')?;
+                }
+                b'\\' => {
+                    idx += 1;
+                    if idx == line.len() {
+                        return Err(Error::Protocol(
+                            "unterminated escape sequence in inline request".into(),
+                        ));
+                    }
+                    arg.push(line[idx]);
+                    idx += 1;
+                }
+                byte => {
+                    arg.push(byte);
+                    idx += 1;
+                }
+            }
+        }
+        args.push(Bytes::from(arg));
+    }
+    Ok(args)
+}
+
+fn read_inline_quoted(
+    line: &[u8],
+    idx: &mut usize,
+    out: &mut Vec<u8>,
+    quote: u8,
+) -> Result<(), Error> {
+    while *idx < line.len() {
+        let byte = line[*idx];
+        *idx += 1;
+        if byte == quote {
+            return Ok(());
+        }
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        if *idx == line.len() {
+            return Err(Error::Protocol(
+                "unterminated escape sequence in inline request".into(),
+            ));
+        }
+
+        let escaped = line[*idx];
+        *idx += 1;
+        match escaped {
+            b'n' if quote == b'"' => out.push(b'\n'),
+            b'r' if quote == b'"' => out.push(b'\r'),
+            b't' if quote == b'"' => out.push(b'\t'),
+            b'b' if quote == b'"' => out.push(8),
+            b'a' if quote == b'"' => out.push(7),
+            b'x' if quote == b'"' && *idx + 1 < line.len() => {
+                if let (Some(high), Some(low)) = (hex_value(line[*idx]), hex_value(line[*idx + 1]))
+                {
+                    out.push((high << 4) | low);
+                    *idx += 2;
+                } else {
+                    out.push(escaped);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Err(Error::Protocol(
+        "unbalanced quotes in inline request".into(),
+    ))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_inline_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
 }
 
 fn parse_frame(c: &mut std::io::Cursor<&[u8]>, depth: usize) -> Result<Frame, Error> {
@@ -97,6 +253,13 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     (start..buf.len().saturating_sub(1)).find(|&i| buf[i] == b'\r' && buf[i + 1] == b'\n')
+}
+
+fn find_lf(buf: &[u8], start: usize) -> Option<usize> {
+    buf.get(start..)?
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map(|offset| start + offset)
 }
 
 fn read_line<'a>(c: &mut std::io::Cursor<&'a [u8]>) -> Result<&'a [u8], Error> {

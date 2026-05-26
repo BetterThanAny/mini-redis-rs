@@ -1,6 +1,6 @@
 use crate::aof::AofHandle;
 use crate::cmd::Command;
-use crate::connection::Connection;
+use crate::connection::{Connection, ReadError};
 use crate::db::Db;
 use crate::resp::Frame;
 use bytes::Bytes;
@@ -91,7 +91,11 @@ async fn handle(
     state: Arc<ServerState>,
 ) -> anyhow::Result<()> {
     let mut conn = Connection::new(socket);
-    while let Some(frame) = conn.read_frame().await? {
+    loop {
+        let frame = match read_next_or_reply_protocol_error(&mut conn).await? {
+            Some(frame) => frame,
+            None => break,
+        };
         match Command::from_frame(frame) {
             Ok(Command::Subscribe(channels)) => {
                 run_subscribed(&mut conn, &db, channels).await?;
@@ -157,6 +161,31 @@ async fn handle(
         }
     }
     Ok(())
+}
+
+async fn read_next_or_reply_protocol_error(conn: &mut Connection) -> anyhow::Result<Option<Frame>> {
+    match conn.read_frame().await {
+        Ok(frame) => Ok(frame),
+        Err(ReadError::Protocol(msg)) => {
+            let _ = conn.write_frame(&protocol_error_frame(&msg)).await;
+            Err(ReadError::Protocol(msg).into())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn protocol_error_frame(message: &str) -> Frame {
+    Frame::Error(format!(
+        "ERR Protocol error: {}",
+        sanitize_error_message(message)
+    ))
+}
+
+fn sanitize_error_message(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect()
 }
 
 struct ClientGuard {
@@ -305,9 +334,14 @@ async fn run_subscribed(
     loop {
         tokio::select! {
             frame_res = conn.read_frame() => {
-                let frame = match frame_res? {
-                    None => break,
-                    Some(f) => f,
+                let frame = match frame_res {
+                    Ok(None) => break,
+                    Ok(Some(f)) => f,
+                    Err(ReadError::Protocol(msg)) => {
+                        let _ = conn.write_frame(&protocol_error_frame(&msg)).await;
+                        return Err(ReadError::Protocol(msg).into());
+                    }
+                    Err(err) => return Err(err.into()),
                 };
                 match Command::from_frame(frame) {
                     Ok(Command::Subscribe(chs)) => {

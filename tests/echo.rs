@@ -34,6 +34,44 @@ async fn ping_with_message() {
 }
 
 #[tokio::test]
+async fn inline_ping_pong() {
+    let (addr, _shutdown) = spawn_server().await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"PING\r\n").await.unwrap();
+    let mut buf = [0u8; 7];
+    tokio::time::timeout(Duration::from_secs(2), sock.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"+PONG\r\n");
+}
+
+#[tokio::test]
+async fn inline_set_with_quoted_value() {
+    let (addr, _shutdown) = spawn_server().await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"SET inline \"hello world\"\r\n")
+        .await
+        .unwrap();
+    let mut ok = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(2), sock.read_exact(&mut ok))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&ok, b"+OK\r\n");
+
+    sock.write_all(b"*2\r\n$3\r\nGET\r\n$6\r\ninline\r\n")
+        .await
+        .unwrap();
+    let mut value = [0u8; 18];
+    tokio::time::timeout(Duration::from_secs(2), sock.read_exact(&mut value))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&value, b"$11\r\nhello world\r\n");
+}
+
+#[tokio::test]
 async fn echo_works() {
     let (addr, _shutdown) = spawn_server().await;
     let mut sock = TcpStream::connect(addr).await.unwrap();
@@ -59,6 +97,30 @@ async fn unknown_command_returns_error() {
         .unwrap()
         .unwrap();
     assert!(buf[..n].starts_with(b"-ERR"), "got: {:?}", &buf[..n]);
+}
+
+#[tokio::test]
+async fn protocol_errors_return_err_before_disconnect() {
+    let (addr, _shutdown) = spawn_server().await;
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    sock.write_all(b"*9999999999\r\n").await.unwrap();
+    let mut buf = vec![0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = &buf[..n];
+    assert!(
+        resp.starts_with(b"-ERR Protocol error: array length"),
+        "got: {resp:?}"
+    );
+    assert!(resp.ends_with(b"\r\n"), "got: {resp:?}");
+
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(n, 0);
 }
 
 #[tokio::test]

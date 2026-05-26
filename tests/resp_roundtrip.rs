@@ -142,9 +142,73 @@ fn streaming_partial_then_complete() {
 }
 
 #[test]
+fn inline_command() {
+    let mut buf = BytesMut::from(&b"PING\r\n"[..]);
+    let f = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(
+        f,
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))])
+    );
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn inline_quoted_argument() {
+    let mut buf = BytesMut::from(&b"SET k \"hello\\nworld\"\r\n"[..]);
+    let f = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(
+        f,
+        Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"SET")),
+            Frame::Bulk(Bytes::from_static(b"k")),
+            Frame::Bulk(Bytes::from_static(b"hello\nworld")),
+        ])
+    );
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn inline_and_resp_frames_can_share_buffer() {
+    let mut buf = BytesMut::from(&b"PING\r\n*1\r\n$4\r\nPING\r\n"[..]);
+    let f1 = parser::parse(&mut buf).unwrap().unwrap();
+    let f2 = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(
+        f1,
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))])
+    );
+    assert_eq!(
+        f2,
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))])
+    );
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn incomplete_inline_returns_none() {
+    let mut buf = BytesMut::from(&b"PING"[..]);
+    assert!(parser::parse(&mut buf).unwrap().is_none());
+    assert_eq!(&buf[..], b"PING");
+}
+
+#[test]
+fn blank_inline_lines_are_ignored() {
+    let mut buf = BytesMut::from(&b"\r\nPING\r\n"[..]);
+    let f = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(
+        f,
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))])
+    );
+    assert!(buf.is_empty());
+}
+
+#[test]
 fn bad_type_byte_errors() {
     let mut buf = BytesMut::from(&b"@bogus\r\n"[..]);
-    assert!(parser::parse(&mut buf).is_err());
+    let frame = parser::parse(&mut buf).unwrap().unwrap();
+    assert_eq!(
+        frame,
+        Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"@bogus"))])
+    );
 }
 
 #[test]

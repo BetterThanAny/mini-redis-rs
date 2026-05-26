@@ -8,6 +8,18 @@ use tokio::time::timeout;
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("connection read idle timeout")]
+    ReadIdleTimeout,
+    #[error("connection closed mid-frame")]
+    ClosedMidFrame,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
 pub struct Connection {
     stream: TcpStream,
     buf: BytesMut,
@@ -23,25 +35,28 @@ impl Connection {
         }
     }
 
-    pub async fn read_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+    pub async fn read_frame(&mut self) -> Result<Option<Frame>, ReadError> {
         loop {
-            if let Some(frame) = parser::parse(&mut self.buf)? {
-                return Ok(Some(frame));
+            match parser::parse(&mut self.buf) {
+                Ok(Some(frame)) => return Ok(Some(frame)),
+                Ok(None) => {}
+                Err(crate::resp::Error::Incomplete) => {}
+                Err(crate::resp::Error::Protocol(msg)) => return Err(ReadError::Protocol(msg)),
             }
             if self.buf.len() > crate::limits::MAX_BUFFERED_FRAME_BYTES {
-                anyhow::bail!(
+                return Err(ReadError::Protocol(format!(
                     "client frame exceeds buffered limit of {} bytes",
                     crate::limits::MAX_BUFFERED_FRAME_BYTES
-                );
+                )));
             }
             let n = timeout(READ_IDLE_TIMEOUT, self.stream.read_buf(&mut self.buf))
                 .await
-                .map_err(|_| anyhow::anyhow!("connection read idle timeout"))??;
+                .map_err(|_| ReadError::ReadIdleTimeout)??;
             if n == 0 {
                 if self.buf.is_empty() {
                     return Ok(None);
                 }
-                return Err(anyhow::anyhow!("connection closed mid-frame"));
+                return Err(ReadError::ClosedMidFrame);
             }
         }
     }
